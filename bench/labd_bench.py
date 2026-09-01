@@ -25,8 +25,25 @@ import sys
 import time
 import urllib.request
 
-KEY = open(os.path.expanduser("~/qwen-serving/api_key.txt")).read().strip()
-BASE = "http://127.0.0.1:18020"
+# The key and the port are read from the environment first: an install that is
+# not at ~/qwen-serving (a container, or this repo cloned anywhere else) used to
+# die here on FileNotFoundError before reaching the server, and a server reached
+# through a mapped host port needs PORT.
+def _key():
+    if os.environ.get("VLLM_API_KEY"):
+        return os.environ["VLLM_API_KEY"]
+    for path in ("api_key.txt",
+                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api_key.txt"),
+                 os.path.expanduser("~/qwen-serving/api_key.txt")):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            continue
+    return ""          # the server is unauthenticated unless a key was set
+
+
+KEY = _key()
+BASE = os.environ.get("BASE_URL", "http://127.0.0.1:%s" % os.environ.get("PORT", "18020"))
 TAG = sys.argv[1] if len(sys.argv) > 1 else "run"
 
 
