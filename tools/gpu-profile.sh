@@ -27,6 +27,8 @@
 #   bash tools/gpu-profile.sh --explain        # the numbers and the arithmetic
 #   bash tools/gpu-profile.sh --no-key         # leave the API key unset
 #   bash tools/gpu-profile.sh --reserve-gib 10 # keep 10 GiB for other workloads
+#   bash tools/gpu-profile.sh --table          # reserve vs context, no write
+#   bash tools/gpu-profile.sh --max-len 33000  # force a ceiling already boot-tested
 #
 # It only reads (nvidia-smi, docker inspect). It never starts, stops or restarts
 # anything, and it never overwrites an .env it did not write without --force.
@@ -38,22 +40,29 @@ PRINT=0
 EXPLAIN=0
 FORCE=0
 NO_KEY=0
-RESERVE_GIB=0
+FORCE_MAX_LEN=0
+SHOW_TABLE=0
+RESERVE_GIB=""                             # empty = derive it from the card
 while [ $# -gt 0 ]; do
   case "$1" in
     --print)       PRINT=1 ;;
-    --explain)     EXPLAIN=1 ;;
+    --explain)     EXPLAIN=1; SHOW_TABLE=1 ;;
+    --table)       SHOW_TABLE=1 ;;
     --force)       FORCE=1 ;;
     --no-key)      NO_KEY=1 ;;
     --mode)        MODE=${2:-}; shift ;;
     --reserve-gib) RESERVE_GIB=${2:-0}; shift ;;
+    --max-len)     FORCE_MAX_LEN=${2:-0}; shift ;;
     -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
   shift
 done
 case "$MODE" in single|batch) ;; *) echo "--mode takes single or batch" >&2; exit 2 ;; esac
-case "$RESERVE_GIB" in ''|*[!0-9]*) echo "--reserve-gib takes a whole number of GiB" >&2; exit 2 ;; esac
+if [ -n "$RESERVE_GIB" ]; then
+  case "$RESERVE_GIB" in ''|*[!0-9]*) echo "--reserve-gib takes a whole number of GiB" >&2; exit 2 ;; esac
+fi
+case "$FORCE_MAX_LEN" in ''|*[!0-9]*) echo "--max-len takes a token count" >&2; exit 2 ;; esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
@@ -66,19 +75,26 @@ REF_PIN_FAST=5583457484          # CTX=fast and CTX=long pinned pool, bytes
 REF_PIN_HUGE=5261334938          # CTX=huge (KVarN) pinned pool, bytes
 REF_BUDGET_FAST_MIB=22856        # 0.93 x 24576, the single-user default
 REF_MARGIN_MIB=1126              # what the shipped pin leaves for transients
-# The fast pin holds 69,758 tokens (README), so one token of bf16 KV costs this
-# much. fp8 and KVarN are the same measurement on their own profiles: 136,429
-# tokens for the same pin at int8 KV, ~20 KB/token effective for 4/2-bit KVarN.
-BPT_BF16=80041
+# Pool bytes per token, measured rather than derived: these are the token counts
+# the two shipped 24 GiB profiles actually report for the pool they pin, with
+# prefix caching on (the state pages and the pool's block granularity are inside
+# the number, which is why it is not simply the 78 KB/token the group fix
+# documents).
+#   CTX=fast  bf16  5,583,457,484 B -> 57,669 tokens
+#   CTX=long  fp8   5,583,457,484 B -> 136,429 tokens
+#   CTX=huge  KVarN 5,261,334,938 B -> 268,169 tokens
+# The effective cost per token rises a little with pool size, so extrapolating
+# upward on these under-predicts the token count, which is the safe direction.
+BPT_BF16=96818
 BPT_FP8=40925
-BPT_KVARN=20480
+BPT_KVARN=19620
+# A ceiling is only accepted if the tokens fit in this much of the pool. The
+# model above is fitted at ~5 GiB; this is what pays for the extrapolation.
+POOL_USE_PCT=98
 # Weights + drafter + CUDA graphs + the profiled activation peak, i.e. the
 # reference budget minus the pool and the margin it left. Constant across cards
 # for a given profile: none of those four terms grows with the card.
 NON_KV_MIB=$(( REF_BUDGET_FAST_MIB - REF_PIN_FAST / 1048576 - REF_MARGIN_MIB ))
-# One resident request's recurrent-state pages (1+k aligned slots). The pool has
-# to cover this on top of the tokens, which is the check vLLM runs at boot.
-STATE_MIB=901                    # 0.88 GiB, the documented k=7 CTX=fast figure
 DESKTOP_MIB=512                  # compositor/X on a desktop card; 0 headless
 MARGIN_MIB=1229                  # 1.2 GiB of transient headroom, on every card
 # Ceilings the model supports, largest that fits wins. The small end matters:
@@ -157,6 +173,20 @@ SLACK_MIB=256                             # keeps the check true after rounding
 # total - 10 GiB; with the card idle it gets the same, so the profile does not
 # change depending on when it was generated. A workload larger than the reserve
 # still wins, and then the fit below is what saves the boot.
+#
+# With no explicit reserve, the default is "assume whatever is on the card
+# stays": a card that is already running someone else's job gets a profile that
+# fits beside it, and an idle card gets the whole thing. Sizing to the current
+# free memory without reserving is the one thing that does not work: a training
+# run that grows from 2.3 GiB to 8.9 GiB between this script and the boot turned
+# a valid profile into a failed startup three times in a row.
+if [ -z "$RESERVE_GIB" ]; then
+  if [ "$(( TOTAL - FREE ))" -le 1536 ]; then
+    RESERVE_GIB=0
+  else
+    RESERVE_GIB=$(( (TOTAL_CUDA - FREE_CUDA + 1023) / 1024 ))
+  fi
+fi
 RESERVE_MIB=$(( RESERVE_GIB * 1024 ))
 FIT_MIB=$(( TOTAL_CUDA - RESERVE_MIB ))
 [ "$FIT_MIB" -gt "$FREE_CUDA" ] && FIT_MIB=$FREE_CUDA
@@ -174,13 +204,13 @@ POOL_MIB=$(( BUDGET_MIB - NON_KV_MIB - MARGIN_MIB ))
 [ "$POOL_MIB" -lt 2048 ] && { echo "gpu-profile: ${POOL_MIB} MiB left for the KV pool after weights/graphs/margin on $NAME; free the card." >&2; exit 1; }
 POOL_BYTES=$(( POOL_MIB * 1048576 ))
 
-# Largest context ceiling whose tokens plus one request's state pages fit the
-# pool. This is vLLM's own boot check: a pool that cannot hold one request at
-# --max-model-len makes the engine refuse to start.
+# Largest context ceiling whose tokens fit the pool. This is vLLM's own boot
+# check: a pool that cannot hold one request at --max-model-len makes the engine
+# refuse to start.
 pick_max_len() {  # <bytes per token>
   local bpt=$1 c best=""
   for c in $CANDIDATES; do
-    if [ $(( c * bpt + STATE_MIB * 1048576 )) -le "$POOL_BYTES" ] && [ "$c" -le "$MODEL_MAX_LEN" ]; then
+    if [ $(( c * bpt * 100 )) -le $(( POOL_BYTES * POOL_USE_PCT )) ] && [ "$c" -le "$MODEL_MAX_LEN" ]; then
       best=$c
     fi
   done
@@ -231,8 +261,28 @@ EOF
     echo "max-model-len   $MAX_LEN (fp8 KV, ${BPT_FP8} B/token)"
   else
     echo "KV pool         ${POOL_MIB} MiB pinned (24 GiB profile pins $(( REF_PIN_FAST / 1048576 )) MiB)"
-    echo "state pages     ${STATE_MIB} MiB per resident request (k=7)"
+    echo "pool cost       ${BPT_BF16} B/token bf16, ${BPT_FP8} fp8, ${BPT_KVARN} KVarN; ceiling takes ${POOL_USE_PCT}% of the pool"
     echo "max-model-len   fast(bf16) $MAX_LEN_FAST | long(fp8) $MAX_LEN_LONG | huge(KVarN) $MAX_LEN_HUGE"
+  fi
+  # On a shared card the context ceiling is a budget decision, so show the curve
+  # instead of one point. These rows assume the card is otherwise free -- the
+  # profile actually written is additionally capped by what is free right now.
+  if [ "$SHOW_TABLE" = 1 ]; then
+    echo
+    printf '  %-9s %-9s %-11s %-11s %s\n' reserve pool fast long huge
+    local r p budget mf ml mh
+    for r in 0 2 4 6 8 10 12 16 20; do
+      budget=$(( TOTAL_CUDA - r * 1024 - SLACK_MIB ))
+      p=$(( budget - NON_KV_MIB - MARGIN_MIB ))
+      if [ "$p" -lt 1024 ]; then
+        printf '  %-9s %s\n' "${r}G" "no pool left"
+        continue
+      fi
+      POOL_BYTES=$(( p * 1048576 ))
+      mf=$(pick_max_len "$BPT_BF16"); ml=$(pick_max_len "$BPT_FP8"); mh=$(pick_max_len "$BPT_KVARN")
+      printf '  %-9s %-9s %-11s %-11s %s\n' "${r}G" "${p}M" "${mf:-none}" "${ml:-none}" "${mh:-none}"
+    done
+    POOL_BYTES=$(( POOL_MIB * 1048576 ))
   fi
 }
 
