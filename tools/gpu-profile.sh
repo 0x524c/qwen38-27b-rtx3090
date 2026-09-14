@@ -338,7 +338,9 @@ VLLM_API_KEY=$KEEP_KEY"
 # attention applies to; long and huge exist to reach the context fast cannot."
 
 if [ "$PRINT" = 1 ]; then
-  printf '%s\n' "$ENV_BODY"
+  # --print is for inspecting the profile, and the profile carries the API key:
+  # printing a live secret into a terminal or a transcript is how it leaks.
+  printf '%s\n' "$ENV_BODY" | sed 's/^VLLM_API_KEY=.*/VLLM_API_KEY=<preserved, not printed>/'
   { echo; reasons; } >&2
   exit 0
 fi
