@@ -9,6 +9,9 @@ venv/
 drafter/data/
 drafter/runs/
 .env
+# The profile generator keeps a backup next to the file it rewrites, and that
+# backup carries the API key with it. `.env` alone does not match it.
+.env.*
 # local reproduction artifacts (symlinks here, so no trailing slash)
 venv
 models
