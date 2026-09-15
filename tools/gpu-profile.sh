@@ -46,6 +46,16 @@ SEATS=""         # empty = the profile's own default
 MODEL_DIR=""     # empty = the profile's default checkpoint
 EXTRA_ENV=""     # extra KEY=VALUE lines for a specific checkpoint
 ADD_EXTRA_ARGS=""  # extra vLLM flags, e.g. a checkpoint-specific --served-model-name
+# W4A8 (int8 activations) for the batch profile. Empty is the default this repo's
+# sm_120 sizing picked; "int8" is what upstream ships. A plain --env INT8_ACT=int8
+# does NOT work: the batch body writes INT8_ACT= first and that empty value wins.
+INT8_VAL=""
+INT8_LAYERS_VAL=${INT8_LAYERS_VAL:-mlp}
+# Prefix caching is on in both shipped profiles. --prefix-cache 0 exists to
+# measure quality on a clean path: gotcha 51 / #64, KVarN + speculation +
+# prefix caching corrupts prompt_logprobs (perplexity reads high) while the
+# generated tokens are unaffected.
+PC_VAL=1
 UTIL_CAP=""      # empty = derived from the card; a checkpoint with a heavier
                  # per-step footprint (the NVFP4 path pads and swizzles) needs a
                  # lower ceiling before its boot stops fitting the budget
@@ -77,6 +87,8 @@ while [ $# -gt 0 ]; do
     --model)       MODEL_DIR=${2:-}; shift ;;
     --gpu-util)    UTIL_CAP=${2:-}; shift ;;
     --env)         EXTRA_ENV="${EXTRA_ENV:-}${2:-}"$'\n'; shift ;;
+    --int8-act)    INT8_VAL=${2:-}; shift ;;
+    --prefix-cache) PC_VAL=${2:-1}; shift ;;
     --extra-args)  ADD_EXTRA_ARGS="${ADD_EXTRA_ARGS:-}${2:-} "; shift ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --no-vision)   VISION=0 ;;
@@ -407,11 +419,12 @@ if [ "$MODE" = batch ]; then
   # not earned -- and it costs quality (+2.2% perplexity in the repo's own table).
   # With quality ahead of speed, this profile is pure W4A16.
   PROFILE_BODY="KV=$BATCH_KV
-PREFIX_CACHE=1
+PREFIX_CACHE=$PC_VAL
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
 MAX_SEQS=64
-INT8_ACT=
+INT8_ACT=$INT8_VAL
+INT8_LAYERS=$INT8_LAYERS_VAL
 VISION=$VISION
 $([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
 $([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
@@ -488,7 +501,7 @@ else
   MAX_LEN_HUGE=$(pick_max_len "$BPT_KVARN")
   PROFILE_BODY="SPEC=dflash2
 CTX=$CTX_DEFAULT
-PREFIX_CACHE=1
+PREFIX_CACHE=$PC_VAL
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
 MAX_SEQS=$MAX_SEQS
