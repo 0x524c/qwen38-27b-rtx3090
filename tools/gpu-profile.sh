@@ -42,6 +42,7 @@ EXPLAIN=0
 FORCE=0
 NO_KEY=0
 SHOW_TABLE=0
+SEATS=""         # empty = the profile's own default
 TARGET_LEN=""
 KV_PREF=auto
 TARGET_REACHED=1
@@ -53,6 +54,7 @@ while [ $# -gt 0 ]; do
     --table)       SHOW_TABLE=1 ;;
     --ctx)         TARGET_LEN=${2:-0}; shift ;;
     --kv)          KV_PREF=${2:-auto}; shift ;;
+    --seats)       SEATS=${2:-0}; shift ;;
     --force)       FORCE=1 ;;
     --no-key)      NO_KEY=1 ;;
     --mode)        MODE=${2:-}; shift ;;
@@ -145,9 +147,12 @@ if command -v docker >/dev/null 2>&1; then
       bash "$IMAGE" -c "$CUDA_PROBE" 2>/dev/null | tail -1)" || true
 fi
 CUDA_UNITS=1
-if ! [ "${TOTAL_CUDA:-}" -gt 0 ] 2>/dev/null || ! [ "${FREE_CUDA:-}" -gt 0 ] 2>/dev/null; then
-  # No docker, or the probe failed: fall back to nvidia-smi with the offsets
-  # measured above, and say so rather than pretending they are exact.
+if ! printf '%s' "${TOTAL_CUDA:-x}" | grep -qE '^[0-9]+$' \
+   || ! printf '%s' "${FREE_CUDA:-x}" | grep -qE '^[0-9]+$'; then
+  # No docker, or the probe failed (it fails while another container holds the
+  # card, and then the last line of its output is not a number): fall back to
+  # nvidia-smi with the offsets measured above, and say so rather than
+  # pretending they are exact.
   CUDA_UNITS=0
   TOTAL_CUDA=$(( TOTAL - 448 )); FREE_CUDA=$(( FREE - 512 ))
 fi
@@ -217,6 +222,13 @@ KVARN_FRAC=${KVARN_FRAC%%.*}
 [ -z "$KVARN_FRAC" ] && KVARN_FRAC=15
 POOL_NOW_MIB=$(( FREE_NOW_MIB - NON_KV_MIB - MARGIN_MIB ))
 POOL_CARD_MIB=$(( FREE_CARD_MIB - NON_KV_MIB - MARGIN_MIB ))
+# The shipped per-mode utilization is also a ceiling on the pool: sizing a pool
+# past WANT_UTIL x total would ask vLLM for memory its own utilization check
+# refuses, so the footprint budget is the smaller of free memory and that cap.
+POOL_AT_WANT_MIB=$(awk -v w="$WANT_UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", w*t}')
+POOL_AT_WANT_MIB=$(( POOL_AT_WANT_MIB - NON_KV_MIB - MARGIN_MIB ))
+[ "$POOL_NOW_MIB" -gt "$POOL_AT_WANT_MIB" ] && POOL_NOW_MIB=$POOL_AT_WANT_MIB
+[ "$POOL_CARD_MIB" -gt "$POOL_AT_WANT_MIB" ] && POOL_CARD_MIB=$POOL_AT_WANT_MIB
 
 # What a pinned pool costs the budget under a given cache format. KVarN needs its
 # staging share on top; the others are the pool and nothing else.
@@ -309,19 +321,26 @@ else
   else
     TARGET_REACHED=1
     MAX_LEN=$TARGET_LEN
-    # Keep a concurrency allowance above the single request the target needs
-    # (the repo's int4pth note calls 1.35x at 262k the useful figure), capped by
-    # what the free card has, and never below the target's own requirement.
-    POOL_MIB=$(( TARGET_POOL_MIB * 135 / 100 ))
-    cap=$(pool_max_mib "$POOL_CARD_MIB" "$CTX_DEFAULT")
-    [ "$POOL_MIB" -gt "$cap" ] && POOL_MIB=$cap
-    nowcap=$(pool_max_mib "$POOL_NOW_MIB" "$CTX_DEFAULT")
-    [ "$POOL_MIB" -gt "$nowcap" ] && POOL_MIB=$nowcap
+    # Pin the largest pool the card allows rather than a bare multiple of the
+    # target. The pool is what both context and concurrency draw from, and a
+    # seat is an admission, not a reservation (the launcher's own note), so a
+    # pool sized for one long request is what caps a server that mostly sees
+    # short ones -- 8 concurrent 40k agent calls need 8 x 40k x 19,620 B of
+    # KVarN, which is more than a single 262144-token request does.
+    POOL_MIB=$(pool_max_mib "$POOL_CARD_MIB" "$CTX_DEFAULT")
+    cap_now=$(pool_max_mib "$POOL_NOW_MIB" "$CTX_DEFAULT")
+    [ "$POOL_MIB" -gt "$cap_now" ] && POOL_MIB=$cap_now
     [ "$POOL_MIB" -lt "$TARGET_POOL_MIB" ] && POOL_MIB=$TARGET_POOL_MIB
   fi
   case "$CTX_DEFAULT" in
-    fast) MAX_SEQS_DEFAULT=8;; long) MAX_SEQS_DEFAULT=4;; huge) MAX_SEQS_DEFAULT=2;;
+    # The shipped single-user defaults are single-stream figures (KVarN ships 2,
+    # which is one long request plus one). A pool this size holds far more short
+    # requests than that, and a server whose load is parallel agent calls hits the
+    # admission limit long before it hits memory, so KVarN gets the same 8 as the
+    # bf16 profile. --seats overrides.
+    fast) MAX_SEQS_DEFAULT=8;; long) MAX_SEQS_DEFAULT=4;; huge) MAX_SEQS_DEFAULT=8;;
   esac
+  MAX_SEQS=${SEATS:-$MAX_SEQS_DEFAULT}
   POOL_FOOTPRINT_MIB=$(pool_footprint_mib "$POOL_MIB" "$CTX_DEFAULT")
   UTIL=$(util_for_pool "$POOL_FOOTPRINT_MIB")
   POOL_BYTES=$(( POOL_MIB * 1048576 ))
@@ -333,7 +352,7 @@ CTX=$CTX_DEFAULT
 PREFIX_CACHE=1
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
-MAX_SEQS=$MAX_SEQS_DEFAULT
+MAX_SEQS=$MAX_SEQS
 KV_MEM=$POOL_BYTES"
 fi
 
@@ -393,6 +412,7 @@ EOF
   fi
 }
 
+[ "$CUDA_UNITS" = 0 ] && echo "gpu-profile: note: the CUDA-view probe did not answer, so these numbers come from\n             nvidia-smi plus the offsets measured on this box (~448 MiB of total and\n             ~512 MiB of free that the CUDA context does not report)." >&2
 if [ "$EXPLAIN" = 1 ]; then
   reasons
   exit 0
