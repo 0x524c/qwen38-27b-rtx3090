@@ -499,6 +499,15 @@ else
   MAX_LEN_FAST=$(pick_max_len "$BPT_BF16")
   MAX_LEN_LONG=$(pick_max_len "$BPT_INT8PTH")
   MAX_LEN_HUGE=$(pick_max_len "$BPT_KVARN")
+  # DFLASH_TOKENS is deliberately left at the drafter's 7 for SPEC=dflash2. Above 7 the
+  # launcher pins the verify block (the adaptive length corrupts the second turn over a
+  # shared prefix on the KVarN cache), so every step then verifies k+1 tokens whether or
+  # not the lookup is firing. Measured on this box at CTX=huge, 45k-token prompts, six
+  # agent tasks: 113.2 tok/s at 7 against 69.3 at 15 (-39%), losing 19-43% on five tasks,
+  # and gaining only on verbatim reproduction (copy: 310 -> 376 tok/s, 7.45 -> 14.27
+  # tok/step). 7 keeps the block adaptive -- the lookup still extends it when it fires,
+  # which is where the gain lives -- and pays for nothing when it does not. Set
+  # DFLASH_TOKENS=15 in the environment only for a reproduction-only run.
   PROFILE_BODY="SPEC=dflash2
 CTX=$CTX_DEFAULT
 PREFIX_CACHE=$PC_VAL
