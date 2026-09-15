@@ -14,6 +14,12 @@ drafter/runs/
 .env.*
 # local reproduction artifacts (symlinks here, so no trailing slash)
 venv
-models
+# models/ holds the 22 GB checkpoint and the 1.2 GB drafter, both fetched by prepare/,
+# plus the agentic chat template, which is authored here and has to be tracked --
+# the fast profile passes it as --chat-template and cannot boot without it. Excluding
+# the directory entry by entry keeps that one file visible to git; the checkpoint
+# directories stay ignored because each top-level entry is excluded and never walked.
+models/*
+!models/*.jinja
 api_key.txt
 bench/results/
