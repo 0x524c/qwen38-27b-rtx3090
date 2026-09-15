@@ -10,6 +10,11 @@
 # NVFP4 checkpoint has been verified in (single-user mode needs the DFlash2 drafter
 # and the MTP/draft-head artifacts that only the W4A16 checkpoint has).
 #
+# Each checkpoint is served under its own model name as well as the generic
+# qwen3.8-27b alias. That is what makes the choice in a harness honest: the loaded
+# server answers only its own name, so picking the other one fails with "model does
+# not exist" instead of quietly answering from the checkpoint you did not select.
+#
 # What each one costs, measured on this box (2026-09-15, 500 W, KVarN, 262144):
 #
 #   W4A16   PPL 8.1840  GSM8K 94.5-95.5%  C1 85.9  pool 796,213 (3.04x)  util 0.92
@@ -45,13 +50,15 @@ case "${1:-}" in
     [ -n "$p" ] && printf '%s\n' "$p" || echo "no pool line: nothing is serving"
     exit 0 ;;
   w4a16)
-    FLAGS=(--mode batch --kv kvarn) ;;
+    FLAGS=(--mode batch --kv kvarn
+           --extra-args "--served-model-name qwen3.8-27b-w4a16-vllm qwen3.8-27b") ;;
   nvfp4)
     [ -d "$REPO/models/Qwen3.8-27B-QUASAR-NVFP4" ] || {
       echo "serve: models/Qwen3.8-27B-QUASAR-NVFP4 is not on disk (20.6 GB, not committed)." >&2
       echo "       /app/venv/bin/hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 --local-dir $NVFP4_DIR" >&2
       exit 1; }
     FLAGS=(--mode batch --kv kvarn --gpu-util 0.85 --model "$NVFP4_DIR" --skip-verify
+           --extra-args "--served-model-name qwen3.8-27b-nvfp4-vllm qwen3.8-27b"
            --env VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS=fp4_gemm) ;;
   *) usage ;;
 esac

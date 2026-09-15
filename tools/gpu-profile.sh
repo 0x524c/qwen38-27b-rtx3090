@@ -45,6 +45,7 @@ SHOW_TABLE=0
 SEATS=""         # empty = the profile's own default
 MODEL_DIR=""     # empty = the profile's default checkpoint
 EXTRA_ENV=""     # extra KEY=VALUE lines for a specific checkpoint
+ADD_EXTRA_ARGS=""  # extra vLLM flags, e.g. a checkpoint-specific --served-model-name
 UTIL_CAP=""      # empty = derived from the card; a checkpoint with a heavier
                  # per-step footprint (the NVFP4 path pads and swizzles) needs a
                  # lower ceiling before its boot stops fitting the budget
@@ -76,6 +77,7 @@ while [ $# -gt 0 ]; do
     --model)       MODEL_DIR=${2:-}; shift ;;
     --gpu-util)    UTIL_CAP=${2:-}; shift ;;
     --env)         EXTRA_ENV="${EXTRA_ENV:-}${2:-}"$'\n'; shift ;;
+    --extra-args)  ADD_EXTRA_ARGS="${ADD_EXTRA_ARGS:-}${2:-} "; shift ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --no-vision)   VISION=0 ;;
     --vision)      VISION=1 ;;
@@ -378,6 +380,9 @@ if [ "$MEM_AVAIL_MIB" -lt "$LOAD_PEAK_MIB" ] || [ "$LOAD_PEAK_MIB" -gt "$MEM_CAP
   fi
 fi
 
+FINAL_EXTRA_ARGS="${ADD_EXTRA_ARGS:-}"
+[ -n "$RAM_EXTRA_ARGS" ] && FINAL_EXTRA_ARGS="${FINAL_EXTRA_ARGS}${RAM_EXTRA_ARGS}"
+
 if [ "$MODE" = batch ]; then
   # Batch mode does not pin the pool: vLLM sizes it from the utilization, so what
   # this can do is choose the cache format and the context ceiling that fit. KVarN
@@ -411,7 +416,7 @@ VISION=$VISION
 $([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
 $([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
 $([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")
-$([ -n "$RAM_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$RAM_EXTRA_ARGS")
+$([ -n "$FINAL_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$FINAL_EXTRA_ARGS")
 $(printf '%s' "${EXTRA_ENV:-}")"
 else
   # Which single-user profile: the fastest one that reaches the target context.
@@ -491,7 +496,9 @@ KV_MEM=$POOL_BYTES
 VISION=$VISION
 $([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
 $([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
-$([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")"
+$([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")
+$([ -n "$FINAL_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$FINAL_EXTRA_ARGS")
+$([ -n "${EXTRA_ENV:-}" ] && printf '%s' "${EXTRA_ENV}")"
 fi
 
 UTIL_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
