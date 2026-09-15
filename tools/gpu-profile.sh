@@ -69,7 +69,9 @@ if [ -n "$RESERVE_GIB" ]; then
   case "$RESERVE_GIB" in ''|*[!0-9]*) echo "--reserve-gib takes a whole number of GiB" >&2; exit 2 ;; esac
 fi
 case "$TARGET_LEN" in *[!0-9]*) echo "--ctx takes a token count" >&2; exit 2 ;; esac
-case "$KV_PREF" in auto|fast|long|huge) ;; *) echo "--kv takes auto, fast, long or huge" >&2; exit 2 ;; esac
+# Single mode names its profiles for the CTX value it writes (fast/long/huge);
+# batch mode names the cache itself (fp8/kvarn/int4pth). Accept both.
+case "$KV_PREF" in auto|fast|long|huge|fp8|kvarn|int4pth) ;; *) echo "--kv takes auto, fast, long, huge, fp8, kvarn or int4pth" >&2; exit 2 ;; esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
@@ -143,16 +145,24 @@ IMAGE=ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
 TOTAL_CUDA=""; FREE_CUDA=""
 if command -v docker >/dev/null 2>&1; then
   CUDA_PROBE='venv/bin/python -c "import torch; f, t = torch.cuda.mem_get_info(); print(t//1048576, f//1048576)"'
-  read -r TOTAL_CUDA FREE_CUDA <<<"$(timeout 240 docker run --rm --gpus all --entrypoint \
-      bash "$IMAGE" -c "$CUDA_PROBE" 2>/dev/null | tail -1)" || true
+  probe=$(timeout 240 docker run --rm --gpus all --entrypoint \
+      bash "$IMAGE" -c "$CUDA_PROBE" 2>/dev/null | tail -1)
+  # Only two decimal integers count as an answer. The probe fails with a torch
+  # error on stderr and nothing on stdout when another container holds the card,
+  # and a read() of that used to leave the variables empty and the arithmetic
+  # below to compute nonsense out of an empty string.
+  case "$probe" in
+    ''|*[!0-9\ ]*) ;;
+    *\ *)
+      case "${probe%% *}" in ''|*[!0-9]*) ;; *) TOTAL_CUDA=${probe%% *} ;; esac
+      case "${probe##* }" in ''|*[!0-9]*) ;; *) FREE_CUDA=${probe##* } ;; esac
+      ;;
+  esac
 fi
 CUDA_UNITS=1
-if ! printf '%s' "${TOTAL_CUDA:-x}" | grep -qE '^[0-9]+$' \
-   || ! printf '%s' "${FREE_CUDA:-x}" | grep -qE '^[0-9]+$'; then
-  # No docker, or the probe failed (it fails while another container holds the
-  # card, and then the last line of its output is not a number): fall back to
-  # nvidia-smi with the offsets measured above, and say so rather than
-  # pretending they are exact.
+if [ -z "$TOTAL_CUDA" ] || [ -z "$FREE_CUDA" ]; then
+  # No docker, or the probe did not answer: fall back to nvidia-smi with the
+  # offsets measured above, and say so rather than pretending they are exact.
   CUDA_UNITS=0
   TOTAL_CUDA=$(( TOTAL - 448 )); FREE_CUDA=$(( FREE - 512 ))
 fi
@@ -211,7 +221,12 @@ RESERVE_MIB=$(( RESERVE_GIB * 1024 ))
 # boot condition is reported instead of being pre-empted by a smaller profile.
 FREE_NOW_MIB=$(( FREE_CUDA - RESERVE_MIB - SLACK_MIB ))
 FREE_CARD_MIB=$(( TOTAL_CUDA - RESERVE_MIB - SLACK_MIB ))
-[ "$FREE_NOW_MIB" -lt 2048 ] && { echo "gpu-profile: only ${FREE_NOW_MIB} MiB usable on $NAME right now." >&2; exit 1; }
+if [ "$FREE_NOW_MIB" -lt 2048 ]; then
+  echo "gpu-profile: only ${FREE_NOW_MIB} MiB usable on $NAME right now ($(( TOTAL - FREE )) MiB held elsewhere)." >&2
+  echo "             If a server of this repo is running, stop it first:" >&2
+  echo "             docker compose --profile single down" >&2
+  exit 1
+fi
 # KVarN's fp16 tail pool and the paged KV cache draw from the same envelope:
 # KVARN_POOL_MEM_FRAC (0.15 single-user, 0.25 batch) is the share of
 # (util x total - weights) the staging pool takes, and the paged cache gets the
@@ -267,6 +282,17 @@ util_for_pool() {  # <pool MiB>
     'BEGIN{u=n/t; if(u>w)u=w; u=int(u*1000)/1000; printf "%.3f", u}'
 }
 
+# Batch mode does not pin the pool, so the transient headroom has to be held back
+# by the utilization itself: there is no pool number to shrink later. Deriving it
+# from free memory alone puts the engine's own warmup over the edge -- at 0.966
+# with MAX_SEQS=64 the first boot here died in "warming up sampler with 64 dummy
+# requests" with 117 MiB free, which is the sharp floor docs/gotchas.md describes.
+util_for_batch() {
+  local avail=$(( FREE_CUDA - RESERVE_MIB - SLACK_MIB - MARGIN_MIB ))
+  awk -v a="$avail" -v t="$TOTAL_CUDA" -v w="$WANT_UTIL" \
+    'BEGIN{u=a/t; if(u>w)u=w; if(u<0.5)u=0.5; u=int(u*1000)/1000; printf "%.3f", u}'
+}
+
 # Largest context ceiling whose tokens fit a pool. This is vLLM's own boot
 # check: a pool that cannot hold one request at --max-model-len makes the engine
 # refuse to start.
@@ -281,12 +307,24 @@ pick_max_len() {  # <bytes per token>
 }
 
 if [ "$MODE" = batch ]; then
+  # Batch mode does not pin the pool: vLLM sizes it from the utilization, so what
+  # this can do is choose the cache format and the context ceiling that fit. KVarN
+  # is the only format that reaches 262144 here, and batch is the mode for many
+  # concurrent requests, where its lack of a speculator matters: no draft means no
+  # per-request recurrent-state slots for drafts, and that -- not the KV tokens --
+  # is what bounds how many requests a hybrid model keeps resident.
+  case "$KV_PREF" in
+    kvarn) BATCH_KV=kvarn; BATCH_BPT=$BPT_KVARN ;;
+    int4pth) BATCH_KV=int4pth; BATCH_BPT=$BPT_INT8PTH ;;
+    *) BATCH_KV=fp8; BATCH_BPT=$BPT_INT8PTH ;;
+  esac
   POOL_MIB=$POOL_NOW_MIB
   POOL_BYTES=$(( POOL_NOW_MIB * 1048576 ))
-  MAX_LEN=$(pick_max_len "$BPT_INT8PTH")
+  MAX_LEN=$(pick_max_len "$BATCH_BPT")
   [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
-  UTIL=$(util_for_pool "$POOL_NOW_MIB")
-  PROFILE_BODY="KV=fp8
+  UTIL=$(util_for_batch)
+  PROFILE_BODY="KV=$BATCH_KV
+PREFIX_CACHE=1
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
 MAX_SEQS=64"
@@ -382,7 +420,7 @@ free to boot    needs ${NEED_FREE_MIB} MiB, ${FREE_CUDA} MiB free now -> $( [ "$
 EOF
   if [ "$MODE" = batch ]; then
     echo "KV pool         sized by vLLM from the budget (batch mode does not pin)"
-    echo "max-model-len   $MAX_LEN (${BPT_INT8PTH} B/token)"
+    echo "max-model-len   $MAX_LEN (${BATCH_BPT:-$BPT_INT8PTH} B/token, KV=$BATCH_KV)"
   else
     echo "KV pool         ${POOL_MIB} MiB pinned (24 GiB profile pins $(( REF_PIN_FAST / 1048576 )) MiB)"
     [ "${POOL_FOOTPRINT_MIB:-$POOL_MIB}" != "$POOL_MIB" ] && \
