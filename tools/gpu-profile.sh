@@ -28,7 +28,8 @@
 #   bash tools/gpu-profile.sh --no-key         # leave the API key unset
 #   bash tools/gpu-profile.sh --reserve-gib 10 # keep 10 GiB for other workloads
 #   bash tools/gpu-profile.sh --table          # reserve vs context, no write
-#   bash tools/gpu-profile.sh --max-len 33000  # force a ceiling already boot-tested
+#   bash tools/gpu-profile.sh --ctx 131072   # a smaller target than the model max
+#   bash tools/gpu-profile.sh --kv fast       # force the bf16 profile if it fits
 #
 # It only reads (nvidia-smi, docker inspect). It never starts, stops or restarts
 # anything, and it never overwrites an .env it did not write without --force.
@@ -40,19 +41,22 @@ PRINT=0
 EXPLAIN=0
 FORCE=0
 NO_KEY=0
-FORCE_MAX_LEN=0
 SHOW_TABLE=0
+TARGET_LEN=""
+KV_PREF=auto
+TARGET_REACHED=1
 RESERVE_GIB=""                             # empty = derive it from the card
 while [ $# -gt 0 ]; do
   case "$1" in
     --print)       PRINT=1 ;;
     --explain)     EXPLAIN=1; SHOW_TABLE=1 ;;
     --table)       SHOW_TABLE=1 ;;
+    --ctx)         TARGET_LEN=${2:-0}; shift ;;
+    --kv)          KV_PREF=${2:-auto}; shift ;;
     --force)       FORCE=1 ;;
     --no-key)      NO_KEY=1 ;;
     --mode)        MODE=${2:-}; shift ;;
     --reserve-gib) RESERVE_GIB=${2:-0}; shift ;;
-    --max-len)     FORCE_MAX_LEN=${2:-0}; shift ;;
     -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -62,7 +66,8 @@ case "$MODE" in single|batch) ;; *) echo "--mode takes single or batch" >&2; exi
 if [ -n "$RESERVE_GIB" ]; then
   case "$RESERVE_GIB" in ''|*[!0-9]*) echo "--reserve-gib takes a whole number of GiB" >&2; exit 2 ;; esac
 fi
-case "$FORCE_MAX_LEN" in ''|*[!0-9]*) echo "--max-len takes a token count" >&2; exit 2 ;; esac
+case "$TARGET_LEN" in *[!0-9]*) echo "--ctx takes a token count" >&2; exit 2 ;; esac
+case "$KV_PREF" in auto|fast|long|huge) ;; *) echo "--kv takes auto, fast, long or huge" >&2; exit 2 ;; esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
@@ -81,12 +86,12 @@ REF_MARGIN_MIB=1126              # what the shipped pin leaves for transients
 # the number, which is why it is not simply the 78 KB/token the group fix
 # documents).
 #   CTX=fast  bf16  5,583,457,484 B -> 57,669 tokens
-#   CTX=long  fp8   5,583,457,484 B -> 136,429 tokens
+#   CTX=long  int8_per_token_head, Triton  5,583,457,484 B -> 136,429 tokens
 #   CTX=huge  KVarN 5,261,334,938 B -> 268,169 tokens
 # The effective cost per token rises a little with pool size, so extrapolating
 # upward on these under-predicts the token count, which is the safe direction.
 BPT_BF16=96818
-BPT_FP8=40925
+BPT_INT8PTH=40925
 BPT_KVARN=19620
 # A ceiling is only accepted if the tokens fit in this much of the pool. The
 # model above is fitted at ~5 GiB; this is what pays for the extrapolation.
@@ -102,6 +107,11 @@ MARGIN_MIB=1229                  # 1.2 GiB of transient headroom, on every card
 # that refuses to boot is worth less than a shorter context that does.
 MODEL_MAX_LEN=262144
 CANDIDATES="8192 16384 32768 40960 49152 57344 65536 81920 98304 114688 131072 163840 196608 229376 262144"
+# No context ceiling by default: the model's own maximum. The repo ships
+# 64k/150k/240k defaults because a 24 GiB card has to choose; this one does not
+# have to, and a profile that stops short of the model's context is a profile the
+# caller has to remember to raise.
+[ -z "$TARGET_LEN" ] && TARGET_LEN=$MODEL_MAX_LEN
 
 # ---- probe ------------------------------------------------------------------
 num() { nvidia-smi --query-gpu="$1" --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -cd '0-9'; }
@@ -160,6 +170,7 @@ fi
 # box: "Free memory on device cuda:0 (28.19/31.45 GiB) on startup is less than
 # desired GPU memory utilization (0.93, 29.25 GiB)").
 RESERVE=$DESKTOP_MIB
+SHARED=0
 if [ "$(( TOTAL - FREE ))" -gt 2048 ]; then
   SHARED=1
   RESERVE=0                               # the other process is already off the top
@@ -188,23 +199,63 @@ if [ -z "$RESERVE_GIB" ]; then
   fi
 fi
 RESERVE_MIB=$(( RESERVE_GIB * 1024 ))
-FIT_MIB=$(( TOTAL_CUDA - RESERVE_MIB ))
-[ "$FIT_MIB" -gt "$FREE_CUDA" ] && FIT_MIB=$FREE_CUDA
-FIT_MIB=$(( FIT_MIB - SLACK_MIB ))
-[ "$FIT_MIB" -lt 4096 ] && { echo "gpu-profile: only ${FIT_MIB} MiB usable on $NAME; free the card first." >&2; exit 1; }
-UTIL=$(awk -v f="$FIT_MIB" -v t="$TOTAL_CUDA" 'BEGIN{u=f/t; if(u>0.98)u=0.98; u=int(u*1000)/1000; printf "%.3f", u}')
-# The shipped default is the target; the free-memory fit caps it.
-[ "$(awk -v a="$UTIL" -v b="$WANT_UTIL" 'BEGIN{print (a>b)?1:0}')" = 1 ] && UTIL=$WANT_UTIL
-BUDGET_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
-# vLLM's startup check is literally `util x total <= free`; rounding the fraction
-# to three decimals is enough to break it (0.9007 up to 0.901 overshot a 29,366
-# MiB free card by 12 MiB), so the budget is clamped to the fit as well.
-[ "$BUDGET_MIB" -gt "$FIT_MIB" ] && BUDGET_MIB=$FIT_MIB
-POOL_MIB=$(( BUDGET_MIB - NON_KV_MIB - MARGIN_MIB ))
-[ "$POOL_MIB" -lt 2048 ] && { echo "gpu-profile: ${POOL_MIB} MiB left for the KV pool after weights/graphs/margin on $NAME; free the card." >&2; exit 1; }
-POOL_BYTES=$(( POOL_MIB * 1048576 ))
+# Two budgets, because the target matters more than the moment. FREE_NOW is what
+# can be handed out without disturbing whatever is already on the card; FREE_CARD
+# is what the card has when it is not shared. A profile that reaches a long
+# context is written from FREE_CARD even when something else is resident, and the
+# boot condition is reported instead of being pre-empted by a smaller profile.
+FREE_NOW_MIB=$(( FREE_CUDA - RESERVE_MIB - SLACK_MIB ))
+FREE_CARD_MIB=$(( TOTAL_CUDA - RESERVE_MIB - SLACK_MIB ))
+[ "$FREE_NOW_MIB" -lt 2048 ] && { echo "gpu-profile: only ${FREE_NOW_MIB} MiB usable on $NAME right now." >&2; exit 1; }
+# KVarN's fp16 tail pool and the paged KV cache draw from the same envelope:
+# KVARN_POOL_MEM_FRAC (0.15 single-user, 0.25 batch) is the share of
+# (util x total - weights) the staging pool takes, and the paged cache gets the
+# rest (kvarn/.../kvarn/config.py, pool_budget_bytes). So a KVarN profile costs
+# its pool divided by (1 - frac), and that is the number the budget has to hold.
+KVARN_FRAC=${KVARN_POOL_MEM_FRAC:-15}
+KVARN_FRAC=${KVARN_FRAC%%.*}
+[ -z "$KVARN_FRAC" ] && KVARN_FRAC=15
+POOL_NOW_MIB=$(( FREE_NOW_MIB - NON_KV_MIB - MARGIN_MIB ))
+POOL_CARD_MIB=$(( FREE_CARD_MIB - NON_KV_MIB - MARGIN_MIB ))
 
-# Largest context ceiling whose tokens fit the pool. This is vLLM's own boot
+# What a pinned pool costs the budget under a given cache format. KVarN needs its
+# staging share on top; the others are the pool and nothing else.
+pool_footprint_mib() {  # <pool MiB> <format>
+  if [ "$2" = huge ]; then
+    printf '%s' $(( $1 * 100 / (100 - KVARN_FRAC) + 1 ))
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# The inverse: the largest pool a footprint budget allows under a format.
+pool_max_mib() {  # <usable footprint MiB> <format>
+  if [ "$2" = huge ]; then
+    printf '%s' $(( $1 * (100 - KVARN_FRAC) / 100 ))
+  else
+    printf '%s' "$1"
+  fi
+}
+[ "$POOL_CARD_MIB" -lt 2048 ] && { echo "gpu-profile: ${POOL_CARD_MIB} MiB left for the KV pool after weights/graphs/margin on $NAME." >&2; exit 1; }
+
+# Pool a context ceiling needs, in MiB, from the measured cost per token. This is
+# vLLM's own boot check: a pool that cannot hold one request at --max-model-len
+# makes the engine refuse to start.
+pool_need_mib() {  # <tokens> <bytes per token>
+  local m=$(( $1 * $2 / 1048576 ))
+  printf '%s' $(( m * 100 / POOL_USE_PCT + 1 ))
+}
+
+# The utilization that matches a pool. vLLM's check is `util x total <= free`, so
+# the fraction is derived from what the pool needs instead of the other way round,
+# and floored to three decimals because rounding up is enough to fail it.
+util_for_pool() {  # <pool MiB>
+  local need=$(( $1 + NON_KV_MIB + MARGIN_MIB + SLACK_MIB ))
+  awk -v n="$need" -v t="$TOTAL_CUDA" -v w="$WANT_UTIL" \
+    'BEGIN{u=n/t; if(u>w)u=w; u=int(u*1000)/1000; printf "%.3f", u}'
+}
+
+# Largest context ceiling whose tokens fit a pool. This is vLLM's own boot
 # check: a pool that cannot hold one request at --max-model-len makes the engine
 # refuse to start.
 pick_max_len() {  # <bytes per token>
@@ -218,30 +269,81 @@ pick_max_len() {  # <bytes per token>
 }
 
 if [ "$MODE" = batch ]; then
-  MAX_LEN=$(pick_max_len "$BPT_FP8")
-  [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_MIB} MiB pool" >&2; exit 1; }
+  POOL_MIB=$POOL_NOW_MIB
+  POOL_BYTES=$(( POOL_NOW_MIB * 1048576 ))
+  MAX_LEN=$(pick_max_len "$BPT_INT8PTH")
+  [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
+  UTIL=$(util_for_pool "$POOL_NOW_MIB")
   PROFILE_BODY="KV=fp8
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
 MAX_SEQS=64"
 else
-  # CTX picks which of the three single-user profiles .env activates; the pool
-  # and the ceiling are written for all three below as a comment block so
-  # switching CTX does not need this script re-run.
-  CTX_DEFAULT=fast
+  # Which single-user profile: the fastest one that reaches the target context.
+  # bf16 KV (CTX=fast, FlashAttention, the split-KV verify kernel) is the fastest
+  # and the only one a 262k target rules out: 24.2 GiB of pool for the tokens
+  # alone. Past that, KVarN (CTX=huge) is the repo's path to 262k and needs about
+  # half the pool of int8_per_token_head (CTX=long, the Triton backend), which is
+  # what makes it the one that survives other work on the card; docs/long-context.md
+  # also measures it faster than the Triton caches at 100k. Order is fastest
+  # first among those that reach the target: fast, then huge, then long.
+  CTX_DEFAULT=""
+  for fmt in fast huge long; do
+    case "$fmt" in
+      fast) bpt=$BPT_BF16;; huge) bpt=$BPT_KVARN;; long) bpt=$BPT_INT8PTH;;
+    esac
+    pool_need=$(pool_need_mib "$TARGET_LEN" "$bpt")
+    need=$(pool_footprint_mib "$pool_need" "$fmt")
+    if [ "$need" -le "$POOL_CARD_MIB" ] && { [ "$KV_PREF" = auto ] || [ "$KV_PREF" = "$fmt" ]; }; then
+      CTX_DEFAULT=$fmt; CTX_BPT=$bpt; TARGET_POOL_MIB=$pool_need; break
+    fi
+  done
+  if [ -z "$CTX_DEFAULT" ]; then
+    # Nothing reaches the target on this card. Fall back to the furthest any
+    # format gets, and say the target was dropped.
+    CTX_DEFAULT=huge; CTX_BPT=$BPT_KVARN
+    POOL_MIB=$(pool_max_mib "$POOL_NOW_MIB" huge)
+    MAX_LEN=$(pick_max_len "$BPT_KVARN")
+    TARGET_REACHED=0
+  else
+    TARGET_REACHED=1
+    MAX_LEN=$TARGET_LEN
+    # Keep a concurrency allowance above the single request the target needs
+    # (the repo's int4pth note calls 1.35x at 262k the useful figure), capped by
+    # what the free card has, and never below the target's own requirement.
+    POOL_MIB=$(( TARGET_POOL_MIB * 135 / 100 ))
+    cap=$(pool_max_mib "$POOL_CARD_MIB" "$CTX_DEFAULT")
+    [ "$POOL_MIB" -gt "$cap" ] && POOL_MIB=$cap
+    nowcap=$(pool_max_mib "$POOL_NOW_MIB" "$CTX_DEFAULT")
+    [ "$POOL_MIB" -gt "$nowcap" ] && POOL_MIB=$nowcap
+    [ "$POOL_MIB" -lt "$TARGET_POOL_MIB" ] && POOL_MIB=$TARGET_POOL_MIB
+  fi
+  case "$CTX_DEFAULT" in
+    fast) MAX_SEQS_DEFAULT=8;; long) MAX_SEQS_DEFAULT=4;; huge) MAX_SEQS_DEFAULT=2;;
+  esac
+  POOL_FOOTPRINT_MIB=$(pool_footprint_mib "$POOL_MIB" "$CTX_DEFAULT")
+  UTIL=$(util_for_pool "$POOL_FOOTPRINT_MIB")
+  POOL_BYTES=$(( POOL_MIB * 1048576 ))
   MAX_LEN_FAST=$(pick_max_len "$BPT_BF16")
-  MAX_LEN_LONG=$(pick_max_len "$BPT_FP8")
+  MAX_LEN_LONG=$(pick_max_len "$BPT_INT8PTH")
   MAX_LEN_HUGE=$(pick_max_len "$BPT_KVARN")
-  [ -z "$MAX_LEN_FAST" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_MIB} MiB pool at bf16 KV" >&2; exit 1; }
-  MAX_LEN=$MAX_LEN_FAST
   PROFILE_BODY="SPEC=dflash2
 CTX=$CTX_DEFAULT
 PREFIX_CACHE=1
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
-MAX_SEQS=8
+MAX_SEQS=$MAX_SEQS_DEFAULT
 KV_MEM=$POOL_BYTES"
 fi
+
+UTIL_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
+# What has to be free for the engine to come up: everything the pool does not cover,
+# plus the pool and, for KVarN, its staging share, plus the transient headroom.
+# vLLM checks the utilization side of this itself at startup.
+[ -n "${POOL_FOOTPRINT_MIB:-}" ] || POOL_FOOTPRINT_MIB=$POOL_MIB
+NEED_FREE_MIB=$(( NON_KV_MIB + POOL_FOOTPRINT_MIB + MARGIN_MIB ))
+BOOTS_NOW=0
+[ "$NEED_FREE_MIB" -le "$FREE_CUDA" ] && BOOTS_NOW=1
 
 reasons() {
   cat <<EOF
@@ -251,18 +353,22 @@ VRAM            ${TOTAL} MiB total (nvidia-smi), ${TOTAL_CUDA} MiB as the CUDA c
 free            ${FREE} MiB free (nvidia-smi), ${FREE_CUDA} MiB as the CUDA context sees it
 held elsewhere  ${OTHER} MiB (nvidia-smi accounting)
 gpu utilization $UTIL  (shipped default for this mode: $WANT_UTIL)
-budget          ${BUDGET_MIB} MiB = $UTIL x ${TOTAL_CUDA}
+budget          ${UTIL_MIB} MiB = $UTIL x ${TOTAL_CUDA}
 non-KV          ${NON_KV_MIB} MiB (weights, drafter, CUDA graphs, activation peak)
 margin          ${MARGIN_MIB} MiB transient + ${RESERVE} MiB desktop reserve + ${SLACK_MIB} MiB rounding slack
 reserved        ${RESERVE_GIB} GiB kept for other workloads (--reserve-gib)
+target context  ${TARGET_LEN}$( [ "$TARGET_REACHED" = 0 ] && echo " (NOT reachable on this card; profile carries ${MAX_LEN})" )
+free to boot    needs ${NEED_FREE_MIB} MiB, ${FREE_CUDA} MiB free now -> $( [ "$BOOTS_NOW" = 1 ] && echo "boots" || echo "WILL NOT BOOT until the card has room" )
 EOF
   if [ "$MODE" = batch ]; then
-    echo "KV pool         sized by vLLM from the budget; batch mode does not pin it"
-    echo "max-model-len   $MAX_LEN (fp8 KV, ${BPT_FP8} B/token)"
+    echo "KV pool         sized by vLLM from the budget (batch mode does not pin)"
+    echo "max-model-len   $MAX_LEN (${BPT_INT8PTH} B/token)"
   else
     echo "KV pool         ${POOL_MIB} MiB pinned (24 GiB profile pins $(( REF_PIN_FAST / 1048576 )) MiB)"
-    echo "pool cost       ${BPT_BF16} B/token bf16, ${BPT_FP8} fp8, ${BPT_KVARN} KVarN; ceiling takes ${POOL_USE_PCT}% of the pool"
-    echo "max-model-len   fast(bf16) $MAX_LEN_FAST | long(fp8) $MAX_LEN_LONG | huge(KVarN) $MAX_LEN_HUGE"
+    [ "${POOL_FOOTPRINT_MIB:-$POOL_MIB}" != "$POOL_MIB" ] && \
+      echo "                + $(( POOL_FOOTPRINT_MIB - POOL_MIB )) MiB KVarN staging at KVARN_POOL_MEM_FRAC=${KVARN_FRAC}%"
+    echo "pool cost       ${BPT_BF16} B/token bf16, ${BPT_INT8PTH} int8_per_token_head, ${BPT_KVARN} KVarN; ceiling takes ${POOL_USE_PCT}% of the pool"
+    echo "ceiling choices fast(bf16) ${MAX_LEN_FAST} | huge(KVarN) ${MAX_LEN_HUGE} | long(int8 pth) ${MAX_LEN_LONG} at this pool"
   fi
   # On a shared card the context ceiling is a budget decision, so show the curve
   # instead of one point. These rows assume the card is otherwise free -- the
@@ -279,7 +385,7 @@ EOF
         continue
       fi
       POOL_BYTES=$(( p * 1048576 ))
-      mf=$(pick_max_len "$BPT_BF16"); ml=$(pick_max_len "$BPT_FP8"); mh=$(pick_max_len "$BPT_KVARN")
+      mf=$(pick_max_len "$BPT_BF16"); ml=$(pick_max_len "$BPT_INT8PTH"); mh=$(pick_max_len "$BPT_KVARN")
       printf '  %-9s %-9s %-11s %-11s %s\n' "${r}G" "${p}M" "${mf:-none}" "${ml:-none}" "${mh:-none}"
     done
     POOL_BYTES=$(( POOL_MIB * 1048576 ))
@@ -297,11 +403,21 @@ if [ -n "$IMAGE_VLLM" ] && [ "$IMAGE_VLLM" != "0.28.0" ]; then
   echo "             pull_policy: missing, so a stale local image is served as-is:" >&2
   echo "             docker pull ghcr.io/syv-ai/qwen38-27b-rtx3090:latest" >&2
 fi
-if [ "$SHARED" = 1 ] || [ "$(awk -v a="$UTIL" -v b="$WANT_UTIL" 'BEGIN{print (a<b)?1:0}')" = 1 ]; then
-  echo "gpu-profile: ${OTHER} MiB of this card is used by another process, so the pool and" >&2
-  echo "             the ceiling are sized to fit free memory (${POOL_MIB} MiB, util ${UTIL})" >&2
-  echo "             rather than from the shipped defaults. Run this again with the card" >&2
-  echo "             free for the full-card profile." >&2
+if [ "$TARGET_REACHED" = 0 ]; then
+  echo "gpu-profile: WARNING: ${TARGET_LEN} tokens do not fit this card at any KV format:" >&2
+  echo "             KVarN (the cheapest) needs $(( $(pool_need_mib "$TARGET_LEN" "$BPT_KVARN") )) MiB of pool and the card" >&2
+  echo "             has ${POOL_CARD_MIB} MiB for one. The profile written carries ${MAX_LEN}." >&2
+fi
+if [ "$BOOTS_NOW" = 0 ]; then
+  echo "gpu-profile: ${OTHER} MiB of this card is used by another process, so this profile will" >&2
+  echo "             NOT boot yet: it needs ${NEED_FREE_MIB} MiB free and ${FREE_CUDA} MiB is free." >&2
+  echo "             The profile is written for the card at ${TARGET_LEN} context anyway; free" >&2
+  echo "             the card (or lower --ctx) and start the server." >&2
+fi
+if [ "$SHARED" = 1 ] && [ "$BOOTS_NOW" = 1 ]; then
+  echo "gpu-profile: ${OTHER} MiB of this card is used by another process, and the profile" >&2
+  echo "             still fits beside it (pool ${POOL_MIB} MiB, util ${UTIL}). The pool was" >&2
+  echo "             capped at what is free now rather than at the card's own budget." >&2
 fi
 if [ "${CC_TAG:-}" = 120 ]; then
   echo "gpu-profile: note: sm_120 has no int8 tensor-core rate advantage to spend on the" >&2
@@ -328,14 +444,17 @@ if [ "$NO_KEY" = 0 ] && [ -z "$KEEP_KEY" ]; then
 fi
 [ -n "$KEEP_KEY" ] && ENV_BODY="$ENV_BODY
 VLLM_API_KEY=$KEEP_KEY"
-[ "$MODE" = single ] && ENV_BODY="$ENV_BODY
+[ "$MODE" = single ] && {
+  ENV_BODY="$ENV_BODY
 #
-# The other two single-user profiles on this card, applied by editing CTX=
-# (pool ${POOL_MIB} MiB is shared by all three, only the ceiling moves):
-#   CTX=long   fp8 KV, 3 drafts      -> MAX_LEN=${MAX_LEN_LONG:-none}
-#   CTX=huge   KVarN 4/2-bit KV      -> MAX_LEN=${MAX_LEN_HUGE:-none}
-# CTX=fast is the fastest of the three and the only one the split-KV verify
-# attention applies to; long and huge exist to reach the context fast cannot."
+# All three single-user profiles on this pool of ${POOL_MIB} MiB (only the cache
+# format, the ceiling and the slot count move -- edit CTX= to switch):
+#   CTX=fast   bf16 KV on FlashAttention, 8 slots      -> ${MAX_LEN_FAST}
+#   CTX=huge   KVarN 4/2-bit, 2 slots                  -> ${MAX_LEN_HUGE}
+#   CTX=long   int8_per_token_head on Triton, 4 slots  -> ${MAX_LEN_LONG}
+# active: ${CTX_DEFAULT}. fast is the fastest and the only one the split-KV verify
+# kernel serves; huge and long are what reach the contexts bf16 cannot hold."
+}
 
 if [ "$PRINT" = 1 ]; then
   # --print is for inspecting the profile, and the profile carries the API key:
