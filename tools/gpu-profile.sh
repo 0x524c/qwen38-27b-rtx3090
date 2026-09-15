@@ -303,6 +303,7 @@ else
     # format gets, and say the target was dropped.
     CTX_DEFAULT=huge; CTX_BPT=$BPT_KVARN
     POOL_MIB=$(pool_max_mib "$POOL_NOW_MIB" huge)
+    POOL_BYTES=$(( POOL_MIB * 1048576 ))
     MAX_LEN=$(pick_max_len "$BPT_KVARN")
     TARGET_REACHED=0
   else
