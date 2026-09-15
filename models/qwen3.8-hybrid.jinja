@@ -1,0 +1,596 @@
+{%- set template_version = "qwen3.8-hybrid-agentic18-frog22.3-v1" %}
+{%- set think_on_tool_failure = think_on_tool_failure if think_on_tool_failure is defined else false %}
+{%- set repeat_nudge_after = repeat_nudge_after if repeat_nudge_after is defined else 6 %}
+{%- set pingpong_nudge_after = pingpong_nudge_after if pingpong_nudge_after is defined else 4 %}
+{%- set warn_vanished_tools = warn_vanished_tools if warn_vanished_tools is defined else true %}
+{%- set mutating_tools = mutating_tools if mutating_tools is defined else 'write edit multiedit patch apply_patch str_replace str_replace_editor str_replace_based_edit_tool write_file write_to_file replace_in_file replace_file_content apply_diff insert_content search_and_replace search_replace edit_file builtin_edit_existing_file create_file create_new_file builtin_create_new_file create replace text_editor notebookedit fs_write move_file create_directory reapply delete delete_file move rename mkdir bash terminal shell exec execute_code execute_command execute_bash run_shell_command run_terminal_command run_terminal_cmd run_command todo todowrite memory skill_manage delegate_task send_message cronjob process use_aws browser_click browser_type browser_press browser_scroll browser_navigate browser_action' %}
+{%- set read_tools = read_tools if read_tools is defined else 'read read_file read_text_file read_multiple_files cat grep glob list ls search view fetch webfetch web_fetch websearch web_search web_search_exa rg ripgrep find find_file list_files list_directory list_dir glob_files codebase_search file_search head tail tree' %}
+{%- set _tool_format = tool_call_format if tool_call_format is defined else 'xml' %}
+{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- set add_vision_id = add_vision_id if add_vision_id is defined else false %}
+{%- set enable_thinking = enable_thinking if enable_thinking is defined else true %}
+{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else false %}
+{%- set _preserve_thinking = preserve_thinking if preserve_thinking is defined else (preserve_reasoning if preserve_reasoning is defined else true) %}
+{%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 %}
+{%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 0 %}
+{%- set _has_tools = (tools is defined and tools and tools is iterable and tools is not mapping) %}
+{%- set ns_skill = namespace(loader=false) %}
+{%- set ns_deleg = namespace(name='') %}
+{%- set _effort_raw = (reasoning_effort | string | lower) if reasoning_effort is defined and reasoning_effort is not none else 'medium' %}
+{%- set _initial_thinking = enable_thinking %}
+{%- set _initial_effort = 'medium' %}
+{%- if _effort_raw in ('none', 'off') %}
+    {%- set _initial_thinking = false %}
+{%- elif _effort_raw in ('minimal', 'low') %}
+    {%- set _initial_effort = 'low' %}
+{%- elif _effort_raw in ('xhigh', 'max', 'ultracode', 'extreme') %}
+    {%- set _initial_effort = 'xhigh' %}
+{%- elif _effort_raw == 'high' %}
+    {%- set _initial_effort = 'high' %}
+{%- endif %}
+{%- set ns_state = namespace(thinking=_initial_thinking, effort=_initial_effort) %}
+{%- set _effort_guidance = (effort_guidance | string | lower) if effort_guidance is defined and effort_guidance is not none else 'agentic' %}
+{%- set _reasoning_instructions = '' %}
+{%- if auto_disable_thinking_with_tools and _has_tools %}
+    {%- set ns_state.thinking = false %}
+{%- endif %}
+{%- for msg in messages %}
+    {%- if msg.role == 'system' or msg.role == 'developer' or msg.role == 'user' %}
+        {%- if msg.content is string %}
+            {%- set _scan_parts = [msg.content] %}
+        {%- elif msg.content is iterable and msg.content is not mapping %}
+            {%- set _scan_parts = msg.content %}
+        {%- else %}
+            {%- set _scan_parts = [] %}
+        {%- endif %}
+        {%- for item in _scan_parts %}
+            {%- if item is string %}
+                {%- set _item_text = item %}
+            {%- elif item is mapping and 'text' in item and item.text is string %}
+                {%- set _item_text = item.text %}
+            {%- else %}
+                {%- set _item_text = '' %}
+            {%- endif %}
+            {%- if _item_text %}
+                {%- if '<|think_off|>' in _item_text %}
+                    {%- set ns_state.thinking = false %}
+                {%- elif '<|think_on|>' in _item_text %}
+                    {%- set ns_state.thinking = true %}
+                {%- elif '<|think_xhigh|>' in _item_text or '<|think_ultracode|>' in _item_text or '<|think_extreme|>' in _item_text or '<|think_max|>' in _item_text %}
+                    {%- set ns_state.thinking = true %}
+                    {%- set ns_state.effort = 'xhigh' %}
+                {%- elif '<|think_high|>' in _item_text %}
+                    {%- set ns_state.thinking = true %}
+                    {%- set ns_state.effort = 'high' %}
+                {%- elif '<|think_low|>' in _item_text or '<|think_minimal|>' in _item_text %}
+                    {%- set ns_state.thinking = true %}
+                    {%- set ns_state.effort = 'low' %}
+                {%- elif '<|think_medium|>' in _item_text %}
+                    {%- set ns_state.thinking = true %}
+                    {%- set ns_state.effort = 'medium' %}
+                {%- endif %}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endfor %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if item is mapping %}
+                {%- if item.type == 'image' or 'image' in item or 'image_url' in item %}
+                    {%- if is_system_content %}
+                        {{- raise_exception('System message cannot contain images.') }}
+                    {%- endif %}
+                    {%- if do_vision_count %}
+                        {%- set image_count.value = image_count.value + 1 %}
+                    {%- endif %}
+                    {%- if add_vision_id %}
+                        {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                    {%- endif %}
+                    {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+                {%- elif item.type == 'video' or 'video' in item %}
+                    {%- if is_system_content %}
+                        {{- raise_exception('System message cannot contain videos.') }}
+                    {%- endif %}
+                    {%- if do_vision_count %}
+                        {%- set video_count.value = video_count.value + 1 %}
+                    {%- endif %}
+                    {%- if add_vision_id %}
+                        {{- 'Video ' ~ video_count.value ~ ': ' }}
+                    {%- endif %}
+                    {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+                {%- elif 'text' in item %}
+                    {{- item.text }}
+                {%- else %}
+                    {{- raise_exception('Unexpected item type in content.') }}
+                {%- endif %}
+            {%- else %}
+                {{- item | string }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- set ns_sys = namespace(count=0) %}
+{%- for message in messages %}
+    {%- if ns_sys.count == loop.index0 and (message.role == 'system' or message.role == 'developer') %}
+        {%- set ns_sys.count = ns_sys.count + 1 %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns_sys.count > 0 %}
+    {%- set _sys_msgs = messages[:ns_sys.count] %}
+    {%- set _sys_msg = messages[0] %}
+    {%- set _msgs = messages[ns_sys.count:] %}
+{%- else %}
+    {%- set _sys_msgs = [] %}
+    {%- set _sys_msg = none %}
+    {%- set _msgs = messages %}
+{%- endif %}
+{%- set _sc = '' %}
+{%- if _sys_msg is not none %}
+    {%- set ns_sc = namespace(text='') %}
+    {%- for m in _sys_msgs %}
+        {%- set _part = render_content(m.content, false, true) | trim %}
+        {%- if _part %}
+            {%- set ns_sc.text = ns_sc.text + ('\n\n' if ns_sc.text else '') + _part %}
+        {%- endif %}
+    {%- endfor %}
+    {%- set _sc = ns_sc.text %}
+    {%- set ns_strip = namespace(text=_sc) %}
+    {%- for _tag in ['<|think_off|>', '<|think_on|>', '<|think_xhigh|>', '<|think_high|>', '<|think_ultracode|>', '<|think_extreme|>', '<|think_max|>', '<|think_medium|>', '<|think_low|>', '<|think_minimal|>'] %}
+        {%- if _tag in ns_strip.text %}
+            {%- set ns_strip.text = ns_strip.text.split(_tag) | join('') %}
+        {%- endif %}
+    {%- endfor %}
+    {%- set _sc = ns_strip.text | trim %}
+    {%- if _sys_msg.content is string and '<__media__>' in _sc %}
+        {%- set _sc = _sc.split('<__media__>') | join('') %}
+    {%- endif %}
+{%- endif %}
+{%- if ns_state.thinking and _effort_guidance == 'minimal' %}
+    {%- if ns_state.effort == 'xhigh' or ns_state.effort == 'high' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif ns_state.effort == 'low' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- endif %}
+{%- elif ns_state.thinking %}
+    {%- if ns_state.effort == 'xhigh' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to xhigh. Think carefully and comprehensively through the task, validate key assumptions, examine plausible alternatives and edge cases, and prioritize maximum correctness, consistency, and clarity. Resolve material uncertainty before acting and verify the result thoroughly.' ~ (' Do not rehearse or draft the full deliverable in reasoning. Use reasoning to resolve its requirements, structure, material uncertainties, edge cases, and validation strategy, then put the deliverable content directly in the tool call.' if _has_tools else '') %}
+    {%- elif ns_state.effort == 'high' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to high. Think carefully through the task, validate key assumptions, and consider plausible alternatives only where they could materially change the result. Keep investigation purposeful and bounded. Investigate when it can materially improve the result. Whether working directly or through delegation, tie each inquiry to a decision, prefer the smallest relevant and authoritative evidence set, synthesize before expanding, and stop when further investigation is unlikely to change the next step. Do not pursue open-ended exploration, repeated failed approaches, or redundant confirmation. Keep the solution disciplined: reuse existing work, prefer standard or native capabilities, choose the smallest robust change, and avoid speculative abstractions or unnecessary scope. Do not trade away validation, security, or accessibility for brevity.' ~ (' Do not rehearse or draft the full deliverable in reasoning. Use reasoning to validate its structure, key assumptions, material risks, and plausible alternatives, then put the deliverable content directly in the tool call.' if _has_tools else '') %}
+    {%- elif ns_state.effort == 'low' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused. Reason only about the immediate unresolved decision and one action ahead. When a safe, reversible action is available, take it and reassess from the result. Use available context and direct inspection first. Investigate when missing information could materially change the action. Whether working directly or through delegation, make one focused check and stop when the evidence supports a sufficient reversible step. Prefer the smallest sufficient, reversible action, reuse existing work or standard and native capabilities, and avoid speculative abstractions. Validate the assumptions that could materially change the result, then act. Do not trade away required validation, security, or accessibility for speed.' ~ (' Do not rehearse or draft the full deliverable in reasoning. Decide only the immediate action and required validation, then put the deliverable content directly in the tool call.' if _has_tools else '') %}
+    {%- elif ns_state.effort == 'medium' %}
+        {%- set _reasoning_instructions = 'Reasoning effort is set to medium. Keep reasoning proportional to the immediate unresolved decision. Treat settled context as settled and reason one decision ahead. When available evidence supports a safe, reversible next action, take it and reassess from the result. Expand reasoning only when material uncertainty could change the action or the action is difficult to reverse. When verification fails, first validate the verifier and choose one falsifiable probe. If two probes do not narrow the same issue, stop the loop, summarize the evidence, and change strategy or report the uncertainty. Do not continue with variations of the same investigation.' ~ (' Do not rehearse or draft the full deliverable in reasoning. Decide only the structure, material risks, and next action, then put the deliverable content directly in the tool call.' if _has_tools else '') ~ ' Prefer the smallest sufficient approach and reuse existing work.' %}
+    {%- endif %}
+{%- endif %}
+{%- if _has_tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if _reasoning_instructions and _effort_guidance == 'minimal' %}
+        {{- _reasoning_instructions + '\n\n' }}
+    {%- endif %}
+    {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
+    {%- for tool in tools %}
+        {{- '\n' }}
+        {%- if tool is mapping and tool.function is defined and tool.function is not none %}
+            {%- if tool.function.name is defined and (tool.function.name | lower) == "skill" %}
+                {%- set ns_skill.loader = true %}
+            {%- endif %}
+            {%- if tool.function.name is defined and ((tool.function.name | lower) == "task" or (tool.function.name | lower) == "agent") %}
+                {%- set ns_deleg.name = tool.function.name %}
+            {%- endif %}
+        {%- endif %}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- '\n</tools>' }}
+    {%- if _tool_format == 'json' %}
+        {%- set _ti_head = 'If you choose to call a function ONLY reply in the following format with NO suffix:\n<think>\nBrief explanation of tool call\n</think>\n<tool_call>\n{"name": "example_function_name", "arguments": {"example_parameter_1": "value_1", "example_parameter_2": "This is the value for the second parameter"}}\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n- Function calls MUST follow the specified format: a single JSON object with "name" and "arguments" keys inside <tool_call></tool_call> XML tags.\n- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n- The <tool_call> tag MUST be at the very beginning of a new line, with NO spaces or indentation before it.\n- To call multiple functions, output a separate <tool_call></tool_call> block for EACH function, one after another - close each block completely before opening the next.\n- Take every required argument value from the user request, visible repository state, the current tool schema, or a previous tool result. If a required value is unknown, inspect first.\n- For edit/write tools, take exact file paths and exact replacement strings from visible repository state or prior tool output - read the file first if you have not seen its current content.\n- Keep working until the user\'s request is complete: after making a change, verify it, then move on to the next step. Prefer small concrete actions over long deliberation - when the next step is unclear, take the smallest informative action.\n- ' %}
+        {%- set _ti_tail = 'End your turn when the task is done, you are blocked, you need the user\'s input, or you have reached a meaningful checkpoint worth showing. When you end, state your result or progress directly, without a tool call.\n</IMPORTANT>' %}
+    {%- else %}
+        {%- set _ti_head = 'If you choose to call a function ONLY reply in the following format with NO suffix:\n<think>\nBrief explanation of tool call\n</think>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n- New tool calls MUST pass every argument as a <parameter=name> block - this is the only valid argument syntax. Historical <arguments_json> blocks are a compatibility rendering of earlier turns.\n- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.\n- To call multiple functions, output a separate <tool_call></tool_call> block for EACH function, one after another - close each block completely before opening the next.\n- Take every required argument value from the user request, visible repository state, the current tool schema, or a previous tool result. If a required value is unknown, inspect first.\n- For edit/write tools, take exact file paths and exact replacement strings from visible repository state or prior tool output - read the file first if you have not seen its current content.\n- Keep working until the user\'s request is complete: after making a change, verify it, then move on to the next step. Prefer small concrete actions over long deliberation - when the next step is unclear, take the smallest informative action.\n- ' %}
+        {%- set _ti_tail = 'End your turn when the task is done, you are blocked, you need the user\'s input, or you have reached a meaningful checkpoint worth showing. When you end, state your result or progress directly, without a tool call.\n</IMPORTANT>' %}
+    {%- endif %}
+    {%- set tool_instructions = _ti_head ~ ('When the work itself enters a distinct failure domain or makes another skill directly relevant - even if the user did not add a new request - load that skill before continuing. Two failed probes on the same symptom make diagnosis a distinct work type.\n- ' if ns_skill.loader else '') ~ _ti_tail %}
+    {{- '\n\n' ~ tool_instructions | trim }}
+    {%- if _reasoning_instructions and _effort_guidance != 'minimal' %}
+        {{- '\n\n' + _reasoning_instructions }}
+    {%- endif %}
+    {%- if _sc %}
+        {{- '\n\n' + _sc }}
+    {%- endif %}
+
+    {%- if include_date is defined and include_date and strftime_now is defined %}
+        {{- '\n\nToday is ' + strftime_now('%Y-%m-%d') + '.' }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if _sc or _reasoning_instructions %}
+        {{- '<|im_start|>system\n' }}
+        {%- if _reasoning_instructions and _sc %}
+            {{- _reasoning_instructions + '\n\n' + _sc }}
+        {%- elif _reasoning_instructions %}
+            {{- _reasoning_instructions }}
+        {%- else %}
+            {{- _sc }}
+        {%- endif %}
+        {%- if include_date is defined and include_date and strftime_now is defined %}
+            {{- '\n\nToday is ' + strftime_now('%Y-%m-%d') + '.' }}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set _last_idx = _msgs | length - 1 %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=_last_idx) %}
+{%- for message in _msgs[::-1] %}
+    {%- set index = (_msgs | length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == 'user' %}
+        {%- set _rc = render_content(message.content, false) | trim %}
+        {%- if not (_rc.startswith('<tool_response>') and _rc.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns.multi_step_tool %}
+    {%- if _last_idx > 50 %}
+        {%- set ns.last_query_index = _last_idx %}
+    {%- else %}
+        {%- set ns.last_query_index = 0 %}
+    {%- endif %}
+{%- endif %}
+{%- set ns2 = namespace(prev_role='', consecutive_failures=0, prev1='', prev2='', repeat=0, last_tool='', tool_ids='', sig1='', sig2='', sig_repeat=0, skill_checkpoint_sent=false, loaded_skills=' ', loaded_skill_list='') %}
+{%- for message in _msgs %}
+    {%- set is_system = (message.role == "system" or message.role == "developer") %}
+    {%- set content = render_content(message.content, true, is_system) | trim %}
+    {%- if is_system or message.role == 'user' %}
+        {%- set ns_strip_msg = namespace(text=content) %}
+        {%- for _tag in ['<|think_off|>', '<|think_on|>', '<|think_xhigh|>', '<|think_high|>', '<|think_ultracode|>', '<|think_extreme|>', '<|think_max|>', '<|think_medium|>', '<|think_low|>', '<|think_minimal|>'] %}
+            {%- if _tag in ns_strip_msg.text %}
+                {%- set ns_strip_msg.text = ns_strip_msg.text.split(_tag) | join('') %}
+            {%- endif %}
+        {%- endfor %}
+        {%- set content = ns_strip_msg.text | trim %}
+    {%- endif %}
+    {%- if is_system %}
+        {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+    {%- elif message.role == 'user' %}
+        {%- set _user_envelope = (content.startswith('<tool_response>') and content.endswith('</tool_response>')) or content.startswith('Attached media from tool result:') %}
+        {%- set ns2.consecutive_failures = 0 %}
+        {%- set ns2.prev1 = '' %}
+        {%- set ns2.prev2 = '' %}
+        {%- set ns2.repeat = 0 %}
+        {%- set ns2.last_tool = '' %}
+        {%- set ns2.tool_ids = '' %}
+        {%- set ns2.sig1 = '' %}
+        {%- set ns2.sig2 = '' %}
+        {%- set ns2.sig_repeat = 0 %}
+        {%- if ns_skill.loader and not _user_envelope and not ns2.skill_checkpoint_sent %}
+            {%- set content = content + '\n\nSYSTEM CHECKPOINT:\nSkill selection and loading is the first tool phase. Make one complete pass over the distinct work types in the task (languages, platforms, failure domains, security surfaces, and requested deliverables) against the available skill descriptions before planning, delegation, research, memory access, or any other tool call. Finding one match does not end comparison.\n\nComplete the match set first: any description that says to load for this kind of task belongs in the set. Then emit one skill call for every set member together in the same skill-only response. Wait for every result, then combine and apply their guidance before continuing.\n\nReserve skill loading for direct matches; weak or incidental relationships are insufficient.' ~ ('\n\nAfter combining the loaded skill guidance, delegate only a clearly independent result needed for the next action to the ' ~ ns_deleg.name ~ ' tool. Keep each delegation brief decision-sized and give it a concrete stopping condition. An empty delegation set is valid. Then proceed to the next concrete action.' if ns_deleg.name else '') %}
+            {%- set ns2.skill_checkpoint_sent = true %}
+        {%- elif ns_skill.loader and not _user_envelope %}
+            {%- set content = content ~ '\n\nSYSTEM CHECKPOINT - CONTINUATION:\nPreviously loaded skills: ' ~ (ns2.loaded_skill_list if ns2.loaded_skill_list else 'none') ~ '.\n\nContinue applying any guidance listed above to the same work. When the work itself enters a distinct failure domain or makes another skill directly relevant - even if the user did not add a new request - complete the match set from the remaining available skills and load every member together in one skill-only response before any other tool. Two failed probes on the same symptom make diagnosis a distinct work type.\n\nReserve skill loading for direct matches; weak or incidental relationships are insufficient.' %}
+        {%- endif %}
+        {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
+    {%- elif message.role == 'assistant' %}
+        {%- if '<__media__>' in content %}
+            {%- set content = content.split('<__media__>') | join('') %}
+        {%- endif %}
+        {%- set reasoning_content = '' %}
+        {%- set _explicit_reasoning = '' %}
+        {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+            {%- if message.reasoning_content is string %}
+                {%- set _explicit_reasoning = message.reasoning_content %}
+            {%- else %}
+                {%- set _explicit_reasoning = message.reasoning_content | string %}
+            {%- endif %}
+        {%- elif message.thinking is defined and message.thinking is not none %}
+            {%- if message.thinking is string %}
+                {%- set _explicit_reasoning = message.thinking %}
+            {%- else %}
+                {%- set _explicit_reasoning = message.thinking | string %}
+            {%- endif %}
+        {%- endif %}
+        {%- if _explicit_reasoning %}
+            {%- set _lead_end = '' %}
+            {%- if content.startswith('<think>') and '</think>' in content %}
+                {%- set _lead_end = '</think>' %}
+            {%- elif content.startswith('<thinking>') and '</thinking>' in content %}
+                {%- set _lead_end = '</thinking>' %}
+            {%- elif content.startswith('</think>') %}
+                {%- set _lead_end = '</think>' %}
+            {%- elif content.startswith('</thinking>') %}
+                {%- set _lead_end = '</thinking>' %}
+            {%- endif %}
+            {%- if _lead_end %}
+                {%- set content = content.split(_lead_end)[-1].lstrip('\n') %}
+            {%- endif %}
+            {%- set reasoning_content = _explicit_reasoning %}
+        {%- else %}
+            {%- set _think_end = '' %}
+            {%- if content.startswith('</think>') %}
+                {%- set _think_end = '</think>' %}
+            {%- elif content.startswith('</thinking>') %}
+                {%- set _think_end = '</thinking>' %}
+            {%- elif '\n</think>' in content %}
+                {%- set _think_end = '\n</think>' %}
+            {%- elif '\n</thinking>' in content %}
+                {%- set _think_end = '\n</thinking>' %}
+            {%- elif '\n</ think>' in content %}
+                {%- set _think_end = '\n</ think>' %}
+            {%- elif '\n</think >' in content %}
+                {%- set _think_end = '\n</think >' %}
+            {%- elif content.startswith('<think>') and '</think>' in content %}
+                {%- set _think_end = '</think>' %}
+            {%- elif content.startswith('<thinking>') and '</thinking>' in content %}
+                {%- set _think_end = '</thinking>' %}
+            {%- endif %}
+            {%- if _think_end %}
+                {%- if 'thinking' in _think_end %}
+                    {%- set _think_start = '<thinking>' %}
+                {%- else %}
+                    {%- set _think_start = '<think>' %}
+                {%- endif %}
+                {%- set reasoning_content = content.split(_think_end)[0].rstrip('\n') %}
+                {%- if _think_start in reasoning_content %}
+                    {%- set reasoning_content = reasoning_content.split(_think_start)[-1].lstrip('\n') %}
+                {%- endif %}
+                {%- set content = content.split(_think_end)[-1].lstrip('\n') %}
+            {%- elif '\n<tool_call>' in content %}
+                {%- set _before = content.split('\n<tool_call>')[0] %}
+                {%- set _cut = (_before | length) + 1 %}
+                {%- set content = content[_cut:] %}
+                {%- set reasoning_content = _before.rstrip('\n') %}
+                {%- if '<think>' in reasoning_content %}
+                    {%- set reasoning_content = reasoning_content.split('<think>')[-1].lstrip('\n') %}
+                {%- endif %}
+            {%- endif %}
+        {%- endif %}
+        {%- if '<__media__>' in reasoning_content %}
+            {%- set reasoning_content = reasoning_content.split('<__media__>') | join('') %}
+        {%- endif %}
+        {%- set reasoning_content = reasoning_content | trim %}
+        {%- if (_preserve_thinking or loop.index0 > ns.last_query_index) %}
+            {{- '<|im_start|>assistant\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>assistant\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls is defined and message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- set ns3 = namespace(first='', n=0, sig='', ids='') %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined and tool_call.function is not none %}
+                    {%- set _tcf = tool_call.function %}
+                {%- else %}
+                    {%- set _tcf = tool_call %}
+                {%- endif %}
+                {%- set _tn = _tcf.name %}
+                {%- if tool_call.id is defined and tool_call.id and _tn %}
+                    {%- set ns3.ids = ns3.ids ~ '|' ~ tool_call.id ~ ':' ~ _tn %}
+                {%- endif %}
+                {%- set ns3.n = ns3.n + 1 %}
+                {%- if ns3.n == 1 %}
+                    {%- set ns3.first = _tn %}
+                {%- elif _tn != ns3.first %}
+                    {%- set ns3.first = '' %}
+                {%- endif %}
+                {%- if _tcf.arguments is defined and _tcf.arguments is not none %}
+                    {%- if _tcf.arguments is mapping %}
+                        {%- set ns3.sig = ns3.sig ~ '|' ~ _tn ~ ':' ~ (_tcf.arguments | tojson) %}
+                    {%- else %}
+                        {%- set ns3.sig = ns3.sig ~ '|' ~ _tn ~ ':' ~ (_tcf.arguments | string) %}
+                    {%- endif %}
+                {%- else %}
+                    {%- set ns3.sig = ns3.sig ~ '|' ~ _tn ~ ':' %}
+                {%- endif %}
+            {%- endfor %}
+            {%- set ns2.last_tool = ns3.first %}
+            {%- set ns2.tool_ids = ns3.ids %}
+            {%- if ns3.sig and (ns3.sig == ns2.sig1 or ns3.sig == ns2.sig2) %}
+                {%- set ns2.sig_repeat = ns2.sig_repeat + 1 %}
+            {%- else %}
+                {%- set ns2.sig_repeat = 0 %}
+            {%- endif %}
+            {%- set ns2.sig2 = ns2.sig1 %}
+            {%- set ns2.sig1 = ns3.sig %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined and tool_call.function is not none %}
+                    {%- set tc = tool_call.function %}
+                {%- else %}
+                    {%- set tc = tool_call %}
+                {%- endif %}
+                {%- if _tool_format == 'json' %}
+                    {%- if not loop.first or content | trim %}
+                        {{- '\n\n' }}
+                    {%- endif %}
+                    {%- set _args = '{}' %}
+                    {%- if tc.arguments is defined and tc.arguments is not none %}
+                        {%- if tc.arguments is mapping %}
+                            {%- set _args = tc.arguments | tojson %}
+                        {%- elif tc.arguments is string and tc.arguments %}
+                            {%- set _args = tc.arguments %}
+                        {%- endif %}
+                    {%- endif %}
+                    {{- '<tool_call>\n{"name": ' }}{{- tc.name | tojson }}{{- ', "arguments": ' }}{{- _args }}{{- '}\n</tool_call>' }}
+                {%- else %}
+                    {%- if loop.first %}
+                        {%- if content | trim %}
+                            {{- '\n\n<tool_call>\n<function=' + tc.name + '>\n' }}
+                        {%- else %}
+                            {{- '<tool_call>\n<function=' + tc.name + '>\n' }}
+                        {%- endif %}
+                    {%- else %}
+                        {{- '\n\n<tool_call>\n<function=' + tc.name + '>\n' }}
+                    {%- endif %}
+                    {%- if tc.arguments is defined and tc.arguments is not none %}
+                        {%- if tc.arguments is mapping %}
+                            {%- for args_name, args_value in tc.arguments.items() %}
+                                {{- '<parameter=' + args_name + '>\n' }}
+                                {%- if args_value is string %}
+                                    {%- set _av = args_value %}
+                                {%- else %}
+                                    {%- set _av = args_value | tojson %}
+                                {%- endif %}
+                                {%- if max_tool_arg_chars > 0 and _av | length > max_tool_arg_chars %}
+                                    {{- _av[:max_tool_arg_chars] + '\n[TRUNCATED - original length ' ~ (_av | length | string) ~ ' chars]' }}
+                                {%- else %}
+                                    {{- _av }}
+                                {%- endif %}
+                                {{- '\n</parameter>\n' }}
+                            {%- endfor %}
+                        {%- elif tc.arguments is string %}
+                            {%- if tc.arguments %}
+                                {{- '<arguments_json>\n' }}
+                                {%- if max_tool_arg_chars > 0 and tc.arguments | length > max_tool_arg_chars %}
+                                    {{- tc.arguments[:max_tool_arg_chars] + '\n[TRUNCATED - original length ' ~ (tc.arguments | length | string) ~ ' chars]' }}
+                                {%- else %}
+                                    {{- tc.arguments }}
+                                {%- endif %}
+                                {{- '\n</arguments_json>\n' }}
+                            {%- endif %}
+                        {%- else %}
+                            {%- set _scalar_args = tc.arguments | tojson %}
+                            {%- if max_tool_arg_chars > 0 and _scalar_args | length > max_tool_arg_chars %}
+                                {{- _scalar_args[:max_tool_arg_chars] + '\n[TRUNCATED - original length ' ~ (_scalar_args | length | string) ~ ' chars]' }}
+                            {%- else %}
+                                {{- _scalar_args }}
+                            {%- endif %}
+                        {%- endif %}
+                    {%- endif %}
+                    {{- '</function>\n</tool_call>' }}
+                {%- endif %}
+            {%- endfor %}
+        {%- else %}
+            {%- set ns2.last_tool = '' %}
+            {%- set ns2.tool_ids = '' %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == 'tool' %}
+        {%- set _tr = render_content(message.content, false, false) %}
+        {%- set _rt = content | trim %}
+        {%- set _result_tool = ns2.last_tool %}
+        {%- if message.tool_call_id is defined and message.tool_call_id and ns2.tool_ids %}
+            {%- set _id_prefix = '|' ~ message.tool_call_id ~ ':' %}
+            {%- if _id_prefix in ns2.tool_ids %}
+                {%- set _result_tool = ns2.tool_ids.split(_id_prefix)[-1].split('|')[0] %}
+            {%- endif %}
+        {%- endif %}
+        {%- if _result_tool and (_result_tool | lower) == 'skill' and '<skill_content name="' in _tr %}
+            {%- set _loaded_name = (_tr.split('<skill_content name="')[-1].split('"')[0]) | trim %}
+            {%- set _loaded_token = '|' ~ (_loaded_name | lower) ~ '|' %}
+            {%- if _loaded_name and _loaded_token not in ns2.loaded_skills %}
+                {%- set ns2.loaded_skills = ns2.loaded_skills ~ _loaded_token %}
+                {%- set ns2.loaded_skill_list = ns2.loaded_skill_list ~ (', ' if ns2.loaded_skill_list else '') ~ _loaded_name %}
+            {%- endif %}
+        {%- endif %}
+        {%- set _mut = _result_tool and (' ' ~ (_result_tool | lower) ~ ' ') in (' ' ~ (mutating_tools | lower) ~ ' ') %}
+        {%- if _rt and (_rt == ns2.prev1 or _rt == ns2.prev2) and not _mut %}
+            {%- set ns2.repeat = ns2.repeat + 1 %}
+        {%- else %}
+            {%- set ns2.repeat = 0 %}
+        {%- endif %}
+        {%- set _same_as_prev = _rt and _rt == ns2.prev1 %}
+        {%- set ns2.prev2 = ns2.prev1 %}
+        {%- set ns2.prev1 = _rt %}
+        {%- set _content_lower = content | lower %}
+        {%- set _content_head = _content_lower[:120] %}
+        {%- set _read_tool = _result_tool and (' ' ~ (_result_tool | lower) ~ ' ') in (' ' ~ (read_tools | lower) ~ ' ') %}
+        {%- set _is_code_or_grep = ('throw new ' in _content_lower or 'throw error' in _content_lower or 'console.error' in _content_lower or 'logger.error' in _content_lower or 'logging.error' in _content_lower or 'import ' in _content_head or 'def ' in _content_head or 'function ' in _content_head) %}
+        {%- set _exit_code_zero = ('exit code: 0' in _content_head or 'process exited with code 0' in _content_head) %}
+        {%- set _error_field_ok = ('"error": null' in _content_head or '"error":null' in _content_head or '"error": false' in _content_head or '"error":false' in _content_head or '"error": ""' in _content_head or '"error":""' in _content_head) %}
+        {%- set _powershell_null = _content_head.startswith('you cannot call a method on a null-valued expression.') %}
+        {%- set _harness_err = 'invalid input for tool' in _content_head or 'json parsing failed' in _content_head or 'unknown tool' in _content_head or 'error repairing' in _content_head or 'tool execution failed' in _content_head or _content_head.startswith('script execution failed:') or _content_head.startswith('mcp error ') or _content_head.startswith('statuscode: non 2xx status code') or _powershell_null %}
+        {%- set _strong_err = (not _read_tool) and (('"error":' in _content_head and not _error_field_ok) or '"status": "error"' in _content_head or '"status":"error"' in _content_head or 'traceback (most recent call last):' in _content_head or 'command not found' in _content_head or 'invalid syntax' in _content_head or (('exit code: ' in _content_head or 'process exited with code' in _content_head) and not _exit_code_zero) or _content_head.startswith('traceback') or _content_head.startswith('error:') or _content_head.startswith('err:') or _content_head.startswith('fatal:') or _content_head.startswith('exception:') or _content_head.startswith('failed to ')) %}
+        {%- set _weak_err = (not _read_tool) and ('error:' in _content_head or 'err:' in _content_head or 'err!' in _content_head or 'fatal:' in _content_head or 'exception:' in _content_head or 'traceback' in _content_head or 'failed to' in _content_head) %}
+        {%- set _weak_suppressed = (_is_code_or_grep or '$ ' in _content_head or 'took ' in _content_head or content | length >= 600) %}
+        {%- if _harness_err or _strong_err or (_weak_err and not _weak_suppressed) %}
+            {%- set ns2.consecutive_failures = ns2.consecutive_failures + 1 %}
+        {%- else %}
+            {%- set ns2.consecutive_failures = 0 %}
+        {%- endif %}
+        {%- if ns2.prev_role != 'tool' %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {%- if max_tool_response_chars > 0 and _tr | length > max_tool_response_chars %}
+            {%- set _half = (max_tool_response_chars / 2) | int %}
+            {%- set _tr = _tr[:_half] + '\n[TRUNCATED - original length ' ~ (_tr | length | string) ~ ' chars]\n' + _tr[(_tr | length) - _half:] %}
+        {%- endif %}
+        {{- '\n<tool_response>\n' + _tr }}
+        {%- if ns2.consecutive_failures >= 2 and _same_as_prev %}
+            {{- '\n\n⚠️ SYSTEM WARNING: ' ~ ns2.consecutive_failures ~ ' consecutive tool errors, and the latest error is identical to the previous one. Retrying the same way will produce the same error - change the approach itself: a different tool, a different strategy' ~ (', a skill whose description directly matches this problem (load it now)' if ns_skill.loader else '') ~ ', or stop and report what you found to the user.' }}
+        {%- elif ns2.consecutive_failures >= 2 %}
+            {{- '\n\n⚠️ SYSTEM WARNING: ' ~ ns2.consecutive_failures ~ ' consecutive tool errors. The latest error differs from the previous one - if each fix is resolving one cause and exposing the next, you are making progress; continue. If the errors look unrelated, step back and diagnose the root cause before the next attempt.' }}
+        {%- elif ns2.consecutive_failures == 1 and _powershell_null %}
+            {{- '\n\n⚠️ SYSTEM WARNING: The previous command returned a PowerShell error and may have partially modified files. Inspect affected artifacts before continuing. Restore a known-good state when needed, then retry with validated state and a corrected approach.' }}
+        {%- elif ns2.consecutive_failures == 1 %}
+            {{- '\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error-shaped output. Short error-shaped outputs often indicate total failure; longer outputs may include partial success. Inspect the result and affected state, then decide whether this is an expected failure you are working through (a failing test or build mid-fix). If so, continue your normal fix cycle. Otherwise diagnose the cause, then retry with corrected arguments or a corrected approach.' }}
+        {%- endif %}
+        {%- if (pingpong_nudge_after > 0 and ns2.sig_repeat >= pingpong_nudge_after + 2 and ns2.prev_role != 'tool') or (repeat_nudge_after > 0 and ns2.repeat >= repeat_nudge_after + 2) %}
+            {{- '\n\nSYSTEM WARNING: A prior strategy-change checkpoint has already fired, and the same action or result pattern is still continuing. If this is deliberate polling, state the awaited state and what changed since the previous check. Otherwise choose exactly one next action now: use a materially different tool or materially different arguments, complete the work from evidence already gathered, or end with a concise blocker report.' }}
+        {%- elif repeat_nudge_after > 0 and ns2.repeat >= repeat_nudge_after %}
+            {{- '\n\nSYSTEM WARNING: The last ' ~ ns2.repeat ~ ' tool results are identical to earlier ones - no new information is entering this loop. If you are deliberately polling for a state change, say what you are waiting for and space out the checks. Otherwise the approach itself must change: re-examine whether your action has any effect and whether your verification can observe it; use a different tool, a different strategy' ~ (', a skill whose description directly matches this problem (load it now)' if ns_skill.loader else '') ~ ', or stop and report the situation to the user.' }}
+        {%- elif pingpong_nudge_after > 0 and ns2.sig_repeat >= pingpong_nudge_after and ns2.prev_role != 'tool' %}
+            {{- '\n\nSYSTEM WARNING: You have repeated the exact same tool call (same tool, same arguments) ' ~ ns2.sig_repeat ~ ' times, or are alternating between the same two calls. Repeating this action cannot help unless external state has changed. If you are deliberately waiting or polling, state what you are waiting for and what has changed. Otherwise take a genuinely different action: a different tool, a different strategy' ~ (', a skill whose description directly matches this problem (load it now)' if ns_skill.loader else '') ~ ', or stop and report the situation to the user.' }}
+        {%- endif %}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last %}
+            {{- '<|im_end|>\n' }}
+        {%- else %}
+            {%- set _next_role = _msgs[loop.index0 + 1].role %}
+            {%- if _next_role != 'tool' %}
+                {{- '<|im_end|>\n' }}
+            {%- endif %}
+        {%- endif %}
+    {%- else %}
+        {{- '<|im_start|>user\n[' + message.role + ']: ' + content + '<|im_end|>\n' }}
+    {%- endif %}
+    {%- set ns2.prev_role = message.role %}
+{%- endfor %}
+{%- if warn_vanished_tools and _has_tools %}
+    {%- set ns_vt = namespace(avail=' ', gone_names=' ', gone_list='') %}
+    {%- for tool in tools %}
+        {%- if tool is mapping and tool.function is defined and tool.function is not none and tool.function.name is defined %}
+            {%- set ns_vt.avail = ns_vt.avail ~ (tool.function.name | lower) ~ ' ' %}
+        {%- elif tool is mapping and tool.name is defined and tool.name %}
+            {%- set ns_vt.avail = ns_vt.avail ~ (tool.name | lower) ~ ' ' %}
+        {%- endif %}
+    {%- endfor %}
+    {%- for m in _msgs %}
+        {%- if m.role == 'assistant' and m.tool_calls is defined and m.tool_calls and m.tool_calls is iterable and m.tool_calls is not mapping %}
+            {%- for tc_v in m.tool_calls %}
+                {%- if tc_v.function is defined and tc_v.function is not none %}
+                    {%- set _vn = tc_v.function.name %}
+                {%- else %}
+                    {%- set _vn = tc_v.name %}
+                {%- endif %}
+                {%- if _vn %}
+                    {%- set _vnl = ' ' ~ (_vn | lower) ~ ' ' %}
+                    {%- if _vnl not in ns_vt.avail and _vnl not in ns_vt.gone_names %}
+                        {%- set ns_vt.gone_names = ns_vt.gone_names ~ (_vn | lower) ~ ' ' %}
+                        {%- set ns_vt.gone_list = ns_vt.gone_list ~ (', ' if ns_vt.gone_list else '') ~ _vn %}
+                    {%- endif %}
+                {%- endif %}
+            {%- endfor %}
+        {%- endif %}
+    {%- endfor %}
+    {%- if ns_vt.gone_list %}
+        {{- '<|im_start|>system\nSYSTEM NOTE: the following tools were used earlier in this session but are NO LONGER AVAILABLE: ' ~ ns_vt.gone_list ~ '. Work only with the tools in the current tool list - the missing ones cannot be restarted or repaired from here. If the task truly requires a missing tool, stop and report that to the user. If the task can be completed safely with the remaining tools, continue with those.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if not ns_state.thinking %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- elif ns2.consecutive_failures >= 2 and not think_on_tool_failure %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
