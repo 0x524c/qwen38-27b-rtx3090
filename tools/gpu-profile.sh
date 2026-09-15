@@ -43,6 +43,20 @@ FORCE=0
 NO_KEY=0
 SHOW_TABLE=0
 SEATS=""         # empty = the profile's own default
+MODEL_DIR=""     # empty = the profile's default checkpoint
+# The entrypoint runs verify.sh --no-server before the launcher, and that gate
+# checks this repo's prepare/ artifacts. A checkpoint from elsewhere fails it on
+# the requantized heads until they are produced, which is a reason to skip the
+# gate, not a reason the model cannot serve.
+SKIP_VERIFY=0
+# Vision is on in every profile: the checkpoint carries the tower and a client may
+# send screenshots. VISION_OFFLOAD=1 (the launcher's default with VISION=1) keeps
+# the tower's weights in pinned host RAM and copies each module in for its own
+# forward: ~9 MiB resident instead of 891 MiB, for ~36 ms per image, which is why
+# the pool sizing below does not have to change. --no-vision writes the LM-only
+# profile the repo ships.
+VISION=1
+VISION_OFFLOAD=1
 TARGET_LEN=""
 KV_PREF=auto
 TARGET_REACHED=1
@@ -55,6 +69,10 @@ while [ $# -gt 0 ]; do
     --ctx)         TARGET_LEN=${2:-0}; shift ;;
     --kv)          KV_PREF=${2:-auto}; shift ;;
     --seats)       SEATS=${2:-0}; shift ;;
+    --model)       MODEL_DIR=${2:-}; shift ;;
+    --skip-verify) SKIP_VERIFY=1 ;;
+    --no-vision)   VISION=0 ;;
+    --vision)      VISION=1 ;;
     --force)       FORCE=1 ;;
     --no-key)      NO_KEY=1 ;;
     --mode)        MODE=${2:-}; shift ;;
@@ -144,7 +162,7 @@ IMAGE=ghcr.io/syv-ai/qwen38-27b-rtx3090:latest
 # exactly what the serving container will see.
 TOTAL_CUDA=""; FREE_CUDA=""
 if command -v docker >/dev/null 2>&1; then
-  CUDA_PROBE='venv/bin/python -c "import torch; f, t = torch.cuda.mem_get_info(); print(t//1048576, f//1048576)"'
+  CUDA_PROBE='venv/bin/python -c "import torch, importlib.util; f, t = torch.cuda.mem_get_info(); print(t//1048576, f//1048576, 1 if importlib.util.find_spec(\"runai_model_streamer\") else 0)"'
   probe=$(timeout 240 docker run --rm --gpus all --entrypoint \
       bash "$IMAGE" -c "$CUDA_PROBE" 2>/dev/null | tail -1)
   # Only two decimal integers count as an answer. The probe fails with a torch
@@ -154,8 +172,10 @@ if command -v docker >/dev/null 2>&1; then
   case "$probe" in
     ''|*[!0-9\ ]*) ;;
     *\ *)
-      case "${probe%% *}" in ''|*[!0-9]*) ;; *) TOTAL_CUDA=${probe%% *} ;; esac
-      case "${probe##* }" in ''|*[!0-9]*) ;; *) FREE_CUDA=${probe##* } ;; esac
+      set -- $probe
+      case "${1:-}" in ''|*[!0-9]*) ;; *) TOTAL_CUDA=$1 ;; esac
+      case "${2:-}" in ''|*[!0-9]*) ;; *) FREE_CUDA=$2 ;; esac
+      case "${3:-}" in 0|1) STREAMER_AVAILABLE=$3 ;; *) STREAMER_AVAILABLE=0 ;; esac
       ;;
   esac
 fi
@@ -323,11 +343,22 @@ if [ "$MODE" = batch ]; then
   MAX_LEN=$(pick_max_len "$BATCH_BPT")
   [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
   UTIL=$(util_for_batch)
+  # INT8_ACT empty: the W4A8 path exists in this repo because int8 tensor cores
+  # run at 2x fp16 on the sm86 cards every batch figure was measured on. On sm_120
+  # they measure 1.05x, so the per-token activation quantization is paid for and
+  # not earned -- and it costs quality (+2.2% perplexity in the repo's own table).
+  # With quality ahead of speed, this profile is pure W4A16.
   PROFILE_BODY="KV=$BATCH_KV
 PREFIX_CACHE=1
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
-MAX_SEQS=64"
+MAX_SEQS=64
+INT8_ACT=
+VISION=$VISION
+$([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
+$([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
+$([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")
+$([ -n "$RAM_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$RAM_EXTRA_ARGS")"
 else
   # Which single-user profile: the fastest one that reaches the target context.
   # bf16 KV (CTX=fast, FlashAttention, the split-KV verify kernel) is the fastest
@@ -391,10 +422,56 @@ PREFIX_CACHE=1
 MAX_LEN=$MAX_LEN
 GPU_UTIL=$UTIL
 MAX_SEQS=$MAX_SEQS
-KV_MEM=$POOL_BYTES"
+KV_MEM=$POOL_BYTES
+VISION=$VISION
+$([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
+$([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
+$([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")"
 fi
 
 UTIL_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
+
+# ---- host RAM preflight ------------------------------------------------------
+# The GPU budget says nothing about host RAM, and host RAM is what took this box
+# down on 2026-09-15: vLLM's stock loader materialises a checkpoint in host memory
+# and compressed-tensors copies it again to repack the scales, so the peak is
+# roughly twice the checkpoint plus the runtime. The compose file now caps the
+# container, which contains the damage; this says so with numbers before a boot is
+# spent failing on it.
+MODEL_PATH=${MODEL_DIR:-/app/models/Qwen3.8-27B-W4A16-AutoRound}
+HOST_MODEL_PATH="$REPO_ROOT${MODEL_PATH#/app}"
+MODEL_MIB=$(( $(find "$HOST_MODEL_PATH" -maxdepth 1 -name '*.safetensors' -printf '%s\n' 2>/dev/null \
+                | awk '{s+=$1} END {print s+0}') / 1048576 ))
+# Unknown path: fall back to the shipped checkpoint's size rather than to zero.
+[ "$MODEL_MIB" -eq 0 ] && MODEL_MIB=$(( REF_PIN_FAST / 1048576 + 11000 ))
+MEM_AVAIL_MIB=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+# 2.5x plus a 4 GiB runtime allowance, calibrated on the two paths that have been
+# measured here: the shipped 16.7 GB W4A16 checkpoint loads inside 40 GiB of
+# available RAM (it did, all through 2026-09-14), while a 20.6 GB NVFP4 checkpoint
+# reached ~78 GiB of anonymous memory before the kernel stepped in (~3.8x), because
+# that path pads and swizzles the scales into new tensors. 2.5x fits both: it keeps
+# the normal checkpoint under the cap and flags the NVFP4 one. It is an estimate and
+# it is only advisory -- the cgroup cap in docker-compose.yml is the bound.
+LOAD_PEAK_MIB=$(( MODEL_MIB * 25 / 10 + 4096 ))
+MEM_CAP_MIB=$(printf '%s' "${QWEN_MEM_LIMIT:-48g}" | sed 's/g$//' | awk '{printf "%d", $1*1024}')
+RAM_EXTRA_ARGS=""
+# Either there is not enough RAM to peak, or the peak would hit the container cap and
+# the boot would end in the container's own OOM kill.
+if [ "$MEM_AVAIL_MIB" -lt "$LOAD_PEAK_MIB" ] || [ "$LOAD_PEAK_MIB" -gt "$MEM_CAP_MIB" ]; then
+  if [ "$STREAMER_AVAILABLE" = 1 ]; then
+    RAM_EXTRA_ARGS='--load-format=runai_streamer --model-loader-extra-config={"memory_limit":2147483648}'
+    echo "gpu-profile: host RAM ${MEM_AVAIL_MIB} MiB cannot cover the ~${LOAD_PEAK_MIB} MiB a" >&2
+    echo "             ${MODEL_MIB} MiB checkpoint peaks at with the stock loader, so the profile uses" >&2
+    echo "             the bounded streamer instead (also faster: gotcha 45)." >&2
+  else
+    echo "gpu-profile: WARNING: ${MEM_AVAIL_MIB} MiB of host RAM against a ~${LOAD_PEAK_MIB} MiB load peak" >&2
+    echo "             for a ${MODEL_MIB} MiB checkpoint (container cap ${MEM_CAP_MIB} MiB). The stock loader" >&2
+    echo "             peaks at whatever RAM exists, which is what took this box down on 2026-09-15." >&2
+    echo "             The cap contains it now; the boot would still fail. Free RAM, or add the" >&2
+    echo "             bounded streamer and rebuild: runai-model-streamer + humanize in" >&2
+    echo "             docker/requirements.txt, then rerun this script." >&2
+  fi
+fi
 # What has to be free for the engine to come up: everything the pool does not cover,
 # plus the pool and, for KVarN, its staging share, plus the transient headroom.
 # vLLM checks the utilization side of this itself at startup.
@@ -415,6 +492,7 @@ budget          ${UTIL_MIB} MiB = $UTIL x ${TOTAL_CUDA}
 non-KV          ${NON_KV_MIB} MiB (weights, drafter, CUDA graphs, activation peak)
 margin          ${MARGIN_MIB} MiB transient + ${RESERVE} MiB desktop reserve + ${SLACK_MIB} MiB rounding slack
 reserved        ${RESERVE_GIB} GiB kept for other workloads (--reserve-gib)
+host RAM        ${MEM_AVAIL_MIB} MiB available, ${MODEL_MIB} MiB checkpoint, ~${LOAD_PEAK_MIB} MiB load peak (estimate), container cap ${MEM_CAP_MIB} MiB${RAM_EXTRA_ARGS:+  (streamer loader)}
 target context  ${TARGET_LEN}$( [ "$TARGET_REACHED" = 0 ] && echo " (NOT reachable on this card; profile carries ${MAX_LEN})" )
 free to boot    needs ${NEED_FREE_MIB} MiB, ${FREE_CUDA} MiB free now -> $( [ "$BOOTS_NOW" = 1 ] && echo "boots" || echo "WILL NOT BOOT until the card has room" )
 EOF

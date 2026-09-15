@@ -31,11 +31,31 @@ x-qwen: &qwen
   build: .
   pull_policy: missing
   ipc: host
+  # Host-RAM containment. vLLM's stock loader materialises the checkpoint in host
+  # memory, and compressed-tensors copies it again to repack it (the NVFP4 loader
+  # pads and swizzles the scales). Loading a 20.6 GB checkpoint that way took this
+  # box's 91 GiB and its 45 GiB of swap on 2026-09-15 and left 141 processes to the
+  # kernel's global OOM killer. The cap keeps that inside the container's own
+  # cgroup: it dies of its own OOM instead of taking the desktop with it. 48 GiB is
+  # ~2.8x the shipped W4A16 checkpoint and leaves the desktop the ~20 GiB it uses.
+  #
+  # oom_score_adj is the other half and it was the real defect: systemd user
+  # services run at 200 and this container ran at 0, so the kernel spent its time
+  # killing 24 MB daemons while the process holding 78 GiB of anonymous memory was
+  # the last candidate. At 500 the container is the first victim instead.
+  mem_limit: ${QWEN_MEM_LIMIT:-48g}
+  memswap_limit: ${QWEN_MEM_LIMIT:-48g}
+  oom_score_adj: 500
   env_file:
     - path: .env
       required: false
   environment:
     HOME: /cache
+    # Cap flashinfer/ninja JIT parallelism: each cicc peaks around 4.5 GB and the
+    # default job count (16 on this host) needs ~72 GB, which OOMs the machine and
+    # kills the build before it can populate the cache in the qwen-cache volume.
+    # With 4 jobs the compile finishes once and later starts reuse the cache.
+    MAX_JOBS: "4"
   volumes:
     - ${MODELS_DIR:-./models}:/app/models
     - qwen-cache:/cache
