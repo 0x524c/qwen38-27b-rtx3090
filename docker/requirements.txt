@@ -17,3 +17,16 @@ ninja==1.13.0
 # members are for HF-hosted --dataset-name values and the plotting subcommands,
 # and this repo's scripts use only `random` and `custom`.
 pandas==3.0.5
+# Bounded weight loading (docs/gotchas.md, gotcha 45). The stock loader
+# materialises the whole checkpoint in host memory and compressed-tensors
+# materialises it again to pad and swizzle the scales: a 20.6 GB NVFP4 checkpoint
+# reached ~78 GiB of anonymous memory on this box and took the machine's 91 GiB
+# plus its 45 GiB of swap (2026-09-15). The streamer caps the load at
+# --model-loader-extra-config memory_limit and is faster doing it (6.3 s against
+# 11.7 s). Do not swap this for runai-model-streamer-s3: it force-imports boto3.
+runai-model-streamer
+humanize
+# bench/quality_battery.py reads parquet (wikitext-2, finew eb-2, gsm8k) and the
+# image as shipped cannot run it: "ModuleNotFoundError: No module named
+# 'pyarrow'". pandas alone does not bring it here.
+pyarrow

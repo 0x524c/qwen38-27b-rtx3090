@@ -44,6 +44,10 @@ NO_KEY=0
 SHOW_TABLE=0
 SEATS=""         # empty = the profile's own default
 MODEL_DIR=""     # empty = the profile's default checkpoint
+EXTRA_ENV=""     # extra KEY=VALUE lines for a specific checkpoint
+UTIL_CAP=""      # empty = derived from the card; a checkpoint with a heavier
+                 # per-step footprint (the NVFP4 path pads and swizzles) needs a
+                 # lower ceiling before its boot stops fitting the budget
 # The entrypoint runs verify.sh --no-server before the launcher, and that gate
 # checks this repo's prepare/ artifacts. A checkpoint from elsewhere fails it on
 # the requantized heads until they are produced, which is a reason to skip the
@@ -70,6 +74,8 @@ while [ $# -gt 0 ]; do
     --kv)          KV_PREF=${2:-auto}; shift ;;
     --seats)       SEATS=${2:-0}; shift ;;
     --model)       MODEL_DIR=${2:-}; shift ;;
+    --gpu-util)    UTIL_CAP=${2:-}; shift ;;
+    --env)         EXTRA_ENV="${EXTRA_ENV:-}${2:-}"$'\n'; shift ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --no-vision)   VISION=0 ;;
     --vision)      VISION=1 ;;
@@ -326,6 +332,52 @@ pick_max_len() {  # <bytes per token>
   printf '%s' "$best"
 }
 
+# ---- host RAM preflight ------------------------------------------------------
+# The GPU budget says nothing about host RAM, and host RAM is what took this box
+# down on 2026-09-15: vLLM's stock loader materialises a checkpoint in host memory
+# and compressed-tensors copies it again to repack the scales, so the peak is
+# roughly twice the checkpoint plus the runtime. The compose file now caps the
+# container, which contains the damage; this says so with numbers before a boot is
+# spent failing on it.
+MODEL_PATH=${MODEL_DIR:-/app/models/Qwen3.8-27B-W4A16-AutoRound}
+HOST_MODEL_PATH="$REPO_ROOT${MODEL_PATH#/app}"
+MODEL_MIB=$(( $(find "$HOST_MODEL_PATH" -maxdepth 1 -name '*.safetensors' -printf '%s\n' 2>/dev/null \
+                | awk '{s+=$1} END {print s+0}') / 1048576 ))
+# Unknown path: fall back to the shipped checkpoint's size rather than to zero.
+[ "$MODEL_MIB" -eq 0 ] && MODEL_MIB=$(( REF_PIN_FAST / 1048576 + 11000 ))
+MEM_AVAIL_MIB=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+# 2.5x plus a 4 GiB runtime allowance, calibrated on the two paths that have been
+# measured here: the shipped 16.7 GB W4A16 checkpoint loads inside 40 GiB of
+# available RAM (it did, all through 2026-09-14), while a 20.6 GB NVFP4 checkpoint
+# reached ~78 GiB of anonymous memory before the kernel stepped in (~3.8x), because
+# that path pads and swizzles the scales into new tensors. 2.5x fits both: it keeps
+# the normal checkpoint under the cap and flags the NVFP4 one. It is an estimate and
+# it is only advisory -- the cgroup cap in docker-compose.yml is the bound.
+LOAD_PEAK_MIB=$(( MODEL_MIB * 25 / 10 + 4096 ))
+MEM_CAP_MIB=$(printf '%s' "${QWEN_MEM_LIMIT:-48g}" | sed 's/g$//' | awk '{printf "%d", $1*1024}')
+RAM_EXTRA_ARGS=""
+# Either there is not enough RAM to peak, or the peak would hit the container cap and
+# the boot would end in the container's own OOM kill.
+if [ "$MEM_AVAIL_MIB" -lt "$LOAD_PEAK_MIB" ] || [ "$LOAD_PEAK_MIB" -gt "$MEM_CAP_MIB" ]; then
+  if [ "$STREAMER_AVAILABLE" = 1 ]; then
+    # 3 GiB, not less: the streamer refuses a limit below what one shard needs and
+    # said so for the NVFP4 checkpoint -- "Memory limit supplied: 2147483648 cannot
+    # be smaller than: 2542796800". Still bounded against the ~78 GiB the stock
+    # loader reached on the same checkpoint.
+    RAM_EXTRA_ARGS='--load-format=runai_streamer --model-loader-extra-config={"memory_limit":3221225472}'
+    echo "gpu-profile: host RAM ${MEM_AVAIL_MIB} MiB cannot cover the ~${LOAD_PEAK_MIB} MiB a" >&2
+    echo "             ${MODEL_MIB} MiB checkpoint peaks at with the stock loader, so the profile uses" >&2
+    echo "             the bounded streamer instead (also faster: gotcha 45)." >&2
+  else
+    echo "gpu-profile: WARNING: ${MEM_AVAIL_MIB} MiB of host RAM against a ~${LOAD_PEAK_MIB} MiB load peak" >&2
+    echo "             for a ${MODEL_MIB} MiB checkpoint (container cap ${MEM_CAP_MIB} MiB). The stock loader" >&2
+    echo "             peaks at whatever RAM exists, which is what took this box down on 2026-09-15." >&2
+    echo "             The cap contains it now; the boot would still fail. Free RAM, or add the" >&2
+    echo "             bounded streamer and rebuild: runai-model-streamer + humanize in" >&2
+    echo "             docker/requirements.txt, then rerun this script." >&2
+  fi
+fi
+
 if [ "$MODE" = batch ]; then
   # Batch mode does not pin the pool: vLLM sizes it from the utilization, so what
   # this can do is choose the cache format and the context ceiling that fit. KVarN
@@ -343,6 +395,7 @@ if [ "$MODE" = batch ]; then
   MAX_LEN=$(pick_max_len "$BATCH_BPT")
   [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
   UTIL=$(util_for_batch)
+  [ -n "$UTIL_CAP" ] && UTIL=$(awk -v a="$UTIL" -v c="$UTIL_CAP" 'BEGIN{if(c<a)printf "%.3f", c; else printf "%s", a}')
   # INT8_ACT empty: the W4A8 path exists in this repo because int8 tensor cores
   # run at 2x fp16 on the sm86 cards every batch figure was measured on. On sm_120
   # they measure 1.05x, so the per-token activation quantization is paid for and
@@ -358,7 +411,8 @@ VISION=$VISION
 $([ "$VISION" = 1 ] && echo "VISION_OFFLOAD=$VISION_OFFLOAD")
 $([ -n "$MODEL_DIR" ] && echo "MODEL=$MODEL_DIR")
 $([ "$SKIP_VERIFY" = 1 ] && echo "VERIFY=0")
-$([ -n "$RAM_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$RAM_EXTRA_ARGS")"
+$([ -n "$RAM_EXTRA_ARGS" ] && echo "EXTRA_ARGS=$RAM_EXTRA_ARGS")
+$(printf '%s' "${EXTRA_ENV:-}")"
 else
   # Which single-user profile: the fastest one that reaches the target context.
   # bf16 KV (CTX=fast, FlashAttention, the split-KV verify kernel) is the fastest
@@ -412,6 +466,17 @@ else
   MAX_SEQS=${SEATS:-$MAX_SEQS_DEFAULT}
   POOL_FOOTPRINT_MIB=$(pool_footprint_mib "$POOL_MIB" "$CTX_DEFAULT")
   UTIL=$(util_for_pool "$POOL_FOOTPRINT_MIB")
+  if [ -n "$UTIL_CAP" ]; then
+    UTIL=$(awk -v a="$UTIL" -v c="$UTIL_CAP" 'BEGIN{if(c<a)printf "%.3f", c; else printf "%s", a}')
+    # a capped utilization cannot pay for that pool, so the pool follows it down
+    POOL_AT_CAP_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
+    POOL_AT_CAP_MIB=$(( POOL_AT_CAP_MIB - NON_KV_MIB - MARGIN_MIB ))
+    cap_pool=$(pool_max_mib "$POOL_AT_CAP_MIB" "$CTX_DEFAULT")
+    [ "$POOL_MIB" -gt "$cap_pool" ] && POOL_MIB=$cap_pool
+    [ "$POOL_MIB" -lt "$TARGET_POOL_MIB" ] && POOL_MIB=$TARGET_POOL_MIB
+    POOL_FOOTPRINT_MIB=$(pool_footprint_mib "$POOL_MIB" "$CTX_DEFAULT")
+    POOL_BYTES=$(( POOL_MIB * 1048576 ))
+  fi
   POOL_BYTES=$(( POOL_MIB * 1048576 ))
   MAX_LEN_FAST=$(pick_max_len "$BPT_BF16")
   MAX_LEN_LONG=$(pick_max_len "$BPT_INT8PTH")
@@ -431,47 +496,6 @@ fi
 
 UTIL_MIB=$(awk -v u="$UTIL" -v t="$TOTAL_CUDA" 'BEGIN{printf "%d", u*t}')
 
-# ---- host RAM preflight ------------------------------------------------------
-# The GPU budget says nothing about host RAM, and host RAM is what took this box
-# down on 2026-09-15: vLLM's stock loader materialises a checkpoint in host memory
-# and compressed-tensors copies it again to repack the scales, so the peak is
-# roughly twice the checkpoint plus the runtime. The compose file now caps the
-# container, which contains the damage; this says so with numbers before a boot is
-# spent failing on it.
-MODEL_PATH=${MODEL_DIR:-/app/models/Qwen3.8-27B-W4A16-AutoRound}
-HOST_MODEL_PATH="$REPO_ROOT${MODEL_PATH#/app}"
-MODEL_MIB=$(( $(find "$HOST_MODEL_PATH" -maxdepth 1 -name '*.safetensors' -printf '%s\n' 2>/dev/null \
-                | awk '{s+=$1} END {print s+0}') / 1048576 ))
-# Unknown path: fall back to the shipped checkpoint's size rather than to zero.
-[ "$MODEL_MIB" -eq 0 ] && MODEL_MIB=$(( REF_PIN_FAST / 1048576 + 11000 ))
-MEM_AVAIL_MIB=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
-# 2.5x plus a 4 GiB runtime allowance, calibrated on the two paths that have been
-# measured here: the shipped 16.7 GB W4A16 checkpoint loads inside 40 GiB of
-# available RAM (it did, all through 2026-09-14), while a 20.6 GB NVFP4 checkpoint
-# reached ~78 GiB of anonymous memory before the kernel stepped in (~3.8x), because
-# that path pads and swizzles the scales into new tensors. 2.5x fits both: it keeps
-# the normal checkpoint under the cap and flags the NVFP4 one. It is an estimate and
-# it is only advisory -- the cgroup cap in docker-compose.yml is the bound.
-LOAD_PEAK_MIB=$(( MODEL_MIB * 25 / 10 + 4096 ))
-MEM_CAP_MIB=$(printf '%s' "${QWEN_MEM_LIMIT:-48g}" | sed 's/g$//' | awk '{printf "%d", $1*1024}')
-RAM_EXTRA_ARGS=""
-# Either there is not enough RAM to peak, or the peak would hit the container cap and
-# the boot would end in the container's own OOM kill.
-if [ "$MEM_AVAIL_MIB" -lt "$LOAD_PEAK_MIB" ] || [ "$LOAD_PEAK_MIB" -gt "$MEM_CAP_MIB" ]; then
-  if [ "$STREAMER_AVAILABLE" = 1 ]; then
-    RAM_EXTRA_ARGS='--load-format=runai_streamer --model-loader-extra-config={"memory_limit":2147483648}'
-    echo "gpu-profile: host RAM ${MEM_AVAIL_MIB} MiB cannot cover the ~${LOAD_PEAK_MIB} MiB a" >&2
-    echo "             ${MODEL_MIB} MiB checkpoint peaks at with the stock loader, so the profile uses" >&2
-    echo "             the bounded streamer instead (also faster: gotcha 45)." >&2
-  else
-    echo "gpu-profile: WARNING: ${MEM_AVAIL_MIB} MiB of host RAM against a ~${LOAD_PEAK_MIB} MiB load peak" >&2
-    echo "             for a ${MODEL_MIB} MiB checkpoint (container cap ${MEM_CAP_MIB} MiB). The stock loader" >&2
-    echo "             peaks at whatever RAM exists, which is what took this box down on 2026-09-15." >&2
-    echo "             The cap contains it now; the boot would still fail. Free RAM, or add the" >&2
-    echo "             bounded streamer and rebuild: runai-model-streamer + humanize in" >&2
-    echo "             docker/requirements.txt, then rerun this script." >&2
-  fi
-fi
 # What has to be free for the engine to come up: everything the pool does not cover,
 # plus the pool and, for KVarN, its staging share, plus the transient headroom.
 # vLLM checks the utilization side of this itself at startup.
