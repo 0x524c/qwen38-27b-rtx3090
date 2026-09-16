@@ -125,6 +125,13 @@ run_claude() {
   # window and auto-compacts there, throwing away 60k of the window this profile actually
   # serves. MAX_LEN is what the running profile was started with, so the client and the
   # server agree without a constant here going stale.
+  # A local endpoint disables the claude.ai connectors either way: an auth source in the
+  # environment takes precedence over the claude.ai login, and the CLI says so in a warning
+  # on every start. Opting out explicitly is the same state, chosen rather than tolerated,
+  # and the warning goes with it -- the opt-out branch returns before the precedence check
+  # that raises it. Scoped to this wrapper on purpose: a normal Claude Code session keeps
+  # its connectors.
+  export ENABLE_CLAUDEAI_MCP_SERVERS=false
   local maxlen; maxlen=$(container_env "$(running_service)" MAX_LEN)
   [ -n "$maxlen" ] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$maxlen"
   echo "qwen38: claude -> http://127.0.0.1:$PORT as $id${maxlen:+ (window $maxlen)}" >&2
