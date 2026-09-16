@@ -56,6 +56,12 @@ INT8_LAYERS_VAL=${INT8_LAYERS_VAL:-mlp}
 # prefix caching corrupts prompt_logprobs (perplexity reads high) while the
 # generated tokens are unaffected.
 PC_VAL=1
+# Single-user speculation. dflash2 attaches the separate DFlash2 drafter; mtp uses the
+# checkpoint's own MTP head, which is the only option a quantized checkpoint can offer
+# (the INT6 build ships a 29-tensor INT5 MTP block); off runs neither.
+SPEC_VAL=dflash2
+# Explicit pinned pool size, for a checkpoint whose weights the budget model does not know.
+KV_MEM_GIB=""
 UTIL_CAP=""      # empty = derived from the card; a checkpoint with a heavier
                  # per-step footprint (the NVFP4 path pads and swizzles) needs a
                  # lower ceiling before its boot stops fitting the budget
@@ -89,6 +95,8 @@ while [ $# -gt 0 ]; do
     --env)         EXTRA_ENV="${EXTRA_ENV:-}${2:-}"$'\n'; shift ;;
     --int8-act)    INT8_VAL=${2:-}; shift ;;
     --prefix-cache) PC_VAL=${2:-1}; shift ;;
+    --spec)        SPEC_VAL=${2:-dflash2}; shift ;;
+    --kv-mem-gib)  KV_MEM_GIB=${2:-}; shift ;;
     --extra-args)  ADD_EXTRA_ARGS="${ADD_EXTRA_ARGS:-}${2:-} "; shift ;;
     --skip-verify) SKIP_VERIFY=1 ;;
     --no-vision)   VISION=0 ;;
@@ -107,6 +115,8 @@ if [ -n "$RESERVE_GIB" ]; then
   case "$RESERVE_GIB" in ''|*[!0-9]*) echo "--reserve-gib takes a whole number of GiB" >&2; exit 2 ;; esac
 fi
 case "$TARGET_LEN" in *[!0-9]*) echo "--ctx takes a token count" >&2; exit 2 ;; esac
+case "$SPEC_VAL" in mtp|dflash2|off) ;; *) echo "--spec takes mtp, dflash2 or off" >&2; exit 2 ;; esac
+case "$KV_MEM_GIB" in ''|*[!0-9]*) [ -n "$KV_MEM_GIB" ] && { echo "--kv-mem-gib takes a whole number of GiB" >&2; exit 2; } ;; esac
 # Single mode names its profiles for the CTX value it writes (fast/long/huge);
 # batch mode names the cache itself (fp8/kvarn/int4pth). Accept both.
 case "$KV_PREF" in auto|fast|long|huge|fp8|kvarn|int4pth) ;; *) echo "--kv takes auto, fast, long, huge, fp8, kvarn or int4pth" >&2; exit 2 ;; esac
@@ -142,7 +152,20 @@ POOL_USE_PCT=98
 # reference budget minus the pool and the margin it left. Constant across cards
 # for a given profile: none of those four terms grows with the card.
 NON_KV_MIB=$(( REF_BUDGET_FAST_MIB - REF_PIN_FAST / 1048576 - REF_MARGIN_MIB ))
+# The compositor reserve is only real on a card that drives a display, and nvidia-smi
+# says so directly. On this box the monitor hangs off the CPU's integrated GPU, so the
+# 5090 reports display_active=Disabled and 512 MiB were being held back from every
+# profile for nothing -- which is exactly the margin a 7.3 bpw checkpoint needed to fit
+# a longer context. DESKTOP_RESERVE_MIB overrides (0 forces headless, N forces N MiB).
 DESKTOP_MIB=512                  # compositor/X on a desktop card; 0 headless
+if [ -n "${DESKTOP_RESERVE_MIB:-}" ]; then
+  DESKTOP_MIB=$DESKTOP_RESERVE_MIB
+else
+  case "$(nvidia-smi --query-gpu=display_active --format=csv,noheader,nounits 2>/dev/null | head -1)" in
+    Disabled) DESKTOP_MIB=0 ;;
+    Enabled)  DESKTOP_MIB=512 ;;
+  esac
+fi
 MARGIN_MIB=1229                  # 1.2 GiB of transient headroom, on every card
 # Ceilings the model supports, largest that fits wins. The small end matters:
 # on a card shared with a training run the pool can be a few GiB, and a profile
@@ -514,7 +537,14 @@ else
   # tok/step). 7 keeps the block adaptive -- the lookup still extends it when it fires,
   # which is where the gain lives -- and pays for nothing when it does not. Set
   # DFLASH_TOKENS=15 in the environment only for a reproduction-only run.
-  PROFILE_BODY="SPEC=dflash2
+  # The budget model below is calibrated on the reference checkpoint's weights, so on a
+  # heavier one it pins a pool the card cannot pay for: the 7.30 bpw INT6 build loads
+  # 22.56 GiB against the reference's 15.6 GiB, and the derived 8.08 GiB pin does not fit.
+  if [ -n "$KV_MEM_GIB" ]; then
+    POOL_BYTES=$(( KV_MEM_GIB * 1073741824 ))
+    echo "gpu-profile: KV_MEM pinned to ${KV_MEM_GIB} GiB by --kv-mem-gib (${POOL_BYTES} B)" >&2
+  fi
+  PROFILE_BODY="SPEC=$SPEC_VAL
 CTX=$CTX_DEFAULT
 PREFIX_CACHE=$PC_VAL
 MAX_LEN=$MAX_LEN
