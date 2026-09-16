@@ -11,6 +11,7 @@
 #   --id NAME     serve under this name instead of the profile's own (the generic
 #                 qwen3.8-27b alias is served either way)
 #   --model DIR   serve this checkpoint directory instead of the profile's default
+#   --force       restart even when the requested profile is the one already running
 #
 # `bash tools/serve.sh fast` still works (a bare profile name means start), and the
 # repo's own labels are aliases: single, single-user (= fast) and w4a16, batch (= wide).
@@ -89,12 +90,13 @@ served_ids() {
     | python3 -c 'import json,sys; print(", ".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null || true
 }
 
-CMD=""; PROFILE=""; ID_OVERRIDE=""; MODEL_OVERRIDE=""; FOLLOW=""
+CMD=""; PROFILE=""; ID_OVERRIDE=""; MODEL_OVERRIDE=""; FOLLOW=""; FORCE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --id)        ID_OVERRIDE=${2:-}; shift 2 ;;
     --model)     MODEL_OVERRIDE=${2:-}; shift 2 ;;
     -f|--follow) FOLLOW=1; shift ;;
+    --force)     FORCE=1; shift ;;
     -h|--help)   usage ;;
     -*)          echo "serve: unknown flag $1" >&2; usage ;;
     *)  if [ -z "$CMD" ]; then CMD=$1
@@ -116,13 +118,17 @@ case "$PROFILE" in
   fast|single|single-user)
     SERVICE=single
     PRIMARY_ID=qwen3.8-27b-w4a16-vllm
-    PROFILE_MODEL=""
+    # Pinned on purpose. The single-user launcher prefers models/...-fast (int4-GPTQ
+    # lm_head + MTP) whenever MODEL arrives empty, and that variant costs 0.6% of
+    # perplexity against the base (8.2424 against 8.1928): leaving this empty would
+    # silently serve the worse checkpoint under the fast profile's name.
+    PROFILE_MODEL="$W4A16_DIR"
     FLAGS=(--mode single --ctx 262144
            --extra-args "--chat-template /app/models/qwen3.8-hybrid.jinja") ;;
   wide|w4a16|batch)
     SERVICE=batch
     PRIMARY_ID=qwen3.8-27b-w4a16-vllm
-    PROFILE_MODEL=""
+    PROFILE_MODEL="$W4A16_DIR"     # same trap as fast: pin what this profile means
     FLAGS=(--mode batch --kv kvarn) ;;
   quality|int6)
     SERVICE=single
@@ -178,7 +184,26 @@ case "$CMD" in
     if [ -n "$FOLLOW" ]; then docker compose logs -f "$svc"; else docker compose logs --tail 40 "$svc"; fi
     exit 0 ;;
   stop)
-    echo "== stopping whatever of this project is running"
+    # Starting what is already running is a no-op: the restart costs six minutes of loading
+# and ~30 s of downtime, and the only reason to want it anyway is a config change that the
+# profile file no longer reflects, which --force covers. The signature is read from the
+# container's own environment (compose passes env_file entries in as process environment),
+# so this never touches the profile file.
+container_env() { docker compose exec -T "$1" printenv "$2" 2>/dev/null || true; }
+served_name() { printf '%s' "$1" | sed -n 's/.*--served-model-name \([^ ]*\).*/\1/p'; }
+if [ -z "$FORCE" ]; then
+  run_svc=$(running_service)
+  if [ -n "$run_svc" ]; then
+    run_model=$(container_env "$run_svc" MODEL)
+    run_id=$(served_name "$(container_env "$run_svc" EXTRA_ARGS)")
+    if [ "$run_svc" = "$SERVICE" ] && [ "$run_model" = "$EFFECTIVE_MODEL" ] && [ "$run_id" = "$EFFECTIVE_ID" ]; then
+      echo "== already serving $EFFECTIVE_ID from $run_model on $run_svc: nothing to do (--force restarts it)"
+      exit 0
+    fi
+  fi
+fi
+
+echo "== stopping whatever of this project is running"
     docker compose --profile batch --profile single down --remove-orphans 2>&1 | sed 's/^/   /'
     exit 0 ;;
   start|restart) ;;
