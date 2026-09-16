@@ -84,8 +84,12 @@ pool_line() {
   [ -n "$svc" ] || svc=$SERVICE
   docker compose logs "$svc" 2>&1 | grep -m1 "GPU KV cache size" || true
 }
-served_ids() {
-  local key; key=$(bash "$REPO/tools/print-api-key.sh" 2>/dev/null) || return 0
+# The environment the running container was started with. compose passes env_file entries
+# in as process environment, which is how the start path can tell what is already serving
+# without reading the profile file.
+container_env() { docker compose exec -T "$1" printenv "$2" 2>/dev/null || true; }
+served_name() { printf '%s' "$1" | sed -n 's/.*--served-model-name \([^ ]*\).*/\1/p'; }
+served_ids() {  local key; key=$(bash "$REPO/tools/print-api-key.sh" 2>/dev/null) || return 0
   curl -s --max-time 8 -H "Authorization: Bearer $key" "http://127.0.0.1:$PORT/v1/models" \
     | python3 -c 'import json,sys; print(", ".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null || true
 }
@@ -184,13 +188,23 @@ case "$CMD" in
     if [ -n "$FOLLOW" ]; then docker compose logs -f "$svc"; else docker compose logs --tail 40 "$svc"; fi
     exit 0 ;;
   stop)
-    # Starting what is already running is a no-op: the restart costs six minutes of loading
-# and ~30 s of downtime, and the only reason to want it anyway is a config change that the
-# profile file no longer reflects, which --force covers. The signature is read from the
-# container's own environment (compose passes env_file entries in as process environment),
-# so this never touches the profile file.
-container_env() { docker compose exec -T "$1" printenv "$2" 2>/dev/null || true; }
-served_name() { printf '%s' "$1" | sed -n 's/.*--served-model-name \([^ ]*\).*/\1/p'; }
+    echo "== stopping whatever of this project is running"
+    docker compose --profile batch --profile single down --remove-orphans 2>&1 | sed 's/^/   /'
+    exit 0 ;;
+  start|restart) ;;
+  *) usage ;;
+esac
+
+EFFECTIVE_ID=${ID_OVERRIDE:-$PRIMARY_ID}
+FLAGS+=(--extra-args "--served-model-name $EFFECTIVE_ID qwen3.8-27b")
+EFFECTIVE_MODEL=${MODEL_OVERRIDE:-$PROFILE_MODEL}
+[ -n "$EFFECTIVE_MODEL" ] && FLAGS+=(--model "$EFFECTIVE_MODEL")
+
+# Starting what is already running is a no-op: a restart costs minutes of loading and the
+# downtime that goes with it, and the only reason to want it anyway is a config change the
+# running container no longer reflects, which --force covers. The signature is read from
+# the container's own environment -- compose passes env_file entries in as process
+# environment -- so this never touches the profile file.
 if [ -z "$FORCE" ]; then
   run_svc=$(running_service)
   if [ -n "$run_svc" ]; then
@@ -202,18 +216,6 @@ if [ -z "$FORCE" ]; then
     fi
   fi
 fi
-
-echo "== stopping whatever of this project is running"
-    docker compose --profile batch --profile single down --remove-orphans 2>&1 | sed 's/^/   /'
-    exit 0 ;;
-  start|restart) ;;
-  *) usage ;;
-esac
-
-EFFECTIVE_ID=${ID_OVERRIDE:-$PRIMARY_ID}
-FLAGS+=(--extra-args "--served-model-name $EFFECTIVE_ID qwen3.8-27b")
-EFFECTIVE_MODEL=${MODEL_OVERRIDE:-$PROFILE_MODEL}
-[ -n "$EFFECTIVE_MODEL" ] && FLAGS+=(--model "$EFFECTIVE_MODEL")
 
 echo "== stopping whatever of this project is running"
 docker compose --profile batch --profile single down --remove-orphans >/dev/null 2>&1 || true
