@@ -3,6 +3,7 @@
 #
 #   bash tools/serve.sh fast      # the default: W4A16 + DFlash2 speculation
 #   bash tools/serve.sh wide      # W4A16, no speculation: for many sessions at once
+#   bash tools/serve.sh quality   # INT6-Mixed + its own MTP head: best quality, 196k context
 #   bash tools/serve.sh nvfp4     # QUASAR NVFP4: needs its own flags, loses on quality
 #   bash tools/serve.sh status    # what is running, and what it came up with
 #
@@ -52,6 +53,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 NVFP4_DIR="/app/models/Qwen3.8-27B-QUASAR-NVFP4"
+INT6_DIR="/app/models/Qwen3.8-27B-INT6-Mixed-AutoRound"
+# The humming kernels (5/6/7-bit weights, which is what the INT6 checkpoint is made of)
+# JIT-compile through a native helper that loads libnvrtc.so.13 by path; libnvrtc then
+# opens libnvrtc-builtins.so.13.0 BY NAME, so that directory has to be on the loader
+# path or the boot dies with "NVRTC_ERROR_BUILTIN_OPERATION_FAILURE".
+VLLM_LDP="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/app/venv/lib/python3.12/site-packages/nvidia/cu13/lib"
 
 usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
@@ -80,6 +87,20 @@ case "${1:-}" in
     SERVICE=batch
     FLAGS=(--mode batch --kv kvarn
            --extra-args "--served-model-name qwen3.8-27b-w4a16-vllm qwen3.8-27b") ;;
+  quality|int6)
+    SERVICE=single
+    [ -d "$REPO/models/Qwen3.8-27B-INT6-Mixed-AutoRound" ] || {
+      echo "serve: models/Qwen3.8-27B-INT6-Mixed-AutoRound is not on disk (25.4 GB, not committed)." >&2
+      echo "       /app/venv/bin/hf download Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound --local-dir $INT6_DIR" >&2
+      exit 1; }
+    # 262144 at 0.98 utilization is the whole card: 22.88 GiB of weights + 4 GiB pinned pool
+    # + the profiled peak leave ~350 MiB free. It is what buys context parity with fast on a
+    # checkpoint whose weights are 7 GiB heavier, and it means nothing else fits on the GPU
+    # while this profile is up. Drop --gpu-util-exact and --ctx to 196608 for headroom.
+    FLAGS=(--mode single --spec mtp --kv huge --ctx 262144 --kv-mem-gib 4 --gpu-util-exact 0.98
+           --no-vision --skip-verify --model "$INT6_DIR" --env "LD_LIBRARY_PATH=$VLLM_LDP"
+           --extra-args "--served-model-name qwen3.8-27b-int6-quality-vllm qwen3.8-27b"
+           --extra-args "--chat-template /app/models/qwen3.8-hybrid.jinja") ;;
   nvfp4)
     SERVICE=batch
     [ -d "$REPO/models/Qwen3.8-27B-QUASAR-NVFP4" ] || {
