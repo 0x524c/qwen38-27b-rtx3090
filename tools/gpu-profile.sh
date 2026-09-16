@@ -410,6 +410,12 @@ if [ "$MODE" = batch ]; then
   POOL_MIB=$POOL_NOW_MIB
   POOL_BYTES=$(( POOL_NOW_MIB * 1048576 ))
   MAX_LEN=$(pick_max_len "$BATCH_BPT")
+  # An explicit --ctx is a ceiling in batch mode too, not only in single mode. The
+  # projection above is calibrated on the reference checkpoint and never looks at the
+  # weights, so for a heavier one it overstates the room KV has: the 7.3 bpw INT6 build
+  # loads 22.56 GiB and leaves 2.44 GiB for KV, where this picked 262144 and the boot
+  # refused with "3.44 GiB KV cache is needed".
+  [ "$TARGET_LEN" -lt "$MAX_LEN" ] && MAX_LEN=$TARGET_LEN
   [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
   UTIL=$(util_for_batch)
   [ -n "$UTIL_CAP" ] && UTIL=$(awk -v a="$UTIL" -v c="$UTIL_CAP" 'BEGIN{if(c<a)printf "%.3f", c; else printf "%s", a}')
