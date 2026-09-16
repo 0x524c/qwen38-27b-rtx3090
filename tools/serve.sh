@@ -7,6 +7,8 @@
 #   qwen38 status              # what is running, and what it came up with
 #   qwen38 list                # the profiles, the model ids they serve, and their cost
 #   qwen38 logs [-f]
+#   qwen38 claude [args]       # Claude Code against whatever is serving
+#   qwen38 pi [args]           # pi against whatever is serving
 #
 #   --id NAME     serve under this name instead of the profile's own (the generic
 #                 qwen3.8-27b alias is served either way)
@@ -74,7 +76,7 @@ W4A16_DIR="/app/models/Qwen3.8-27B-W4A16-AutoRound"
 VLLM_LDP="/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/app/venv/lib/python3.12/site-packages/nvidia/cu13/lib"
 PORT="${PORT:-18020}"
 
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Status has to work for whichever profile is up, and the two live in different
 # compose services with different logs, so the service is read from what is running.
@@ -89,18 +91,76 @@ pool_line() {
 # without reading the profile file.
 container_env() { docker compose exec -T "$1" printenv "$2" 2>/dev/null || true; }
 served_name() { printf '%s' "$1" | sed -n 's/.*--served-model-name \([^ ]*\).*/\1/p'; }
+# The client wrappers below hand the model name to Claude Code and to pi, and they read it
+# out of the running profile rather than from a constant: vLLM 0.28 ships the Anthropic
+# Messages API (vllm/entrypoints/anthropic, POST /v1/messages) beside the OpenAI one, so
+# Claude Code needs no proxy, and pi already has these ids registered in its models.json.
+# A stale constant here would point a client at a checkpoint the card is not holding.
+client_target() {   # prints the served id, or explains why it cannot
+  local svc; svc=$(running_service)
+  [ -n "$svc" ] || { echo "qwen38: nothing is serving. Start it with: qwen38 start fast" >&2; exit 1; }
+  local id; id=$(served_name "$(container_env "$svc" EXTRA_ARGS)")
+  [ -n "$id" ] || { echo "qwen38: could not read the served model name out of the $svc container" >&2; exit 1; }
+  printf '%s' "$id"
+}
+run_claude() {
+  command -v claude >/dev/null 2>&1 || { echo "qwen38: claude is not on PATH" >&2; exit 1; }
+  local id; id=$(client_target)
+  local key; key=$(bash "$REPO/tools/print-api-key.sh" 2>/dev/null) || {
+    echo "qwen38: could not read the API key (tools/print-api-key.sh)" >&2; exit 1; }
+  # ANTHROPIC_AUTH_TOKEN and not ANTHROPIC_API_KEY: the token variable is what makes Claude
+  # Code send "Authorization: Bearer", which is the header this server accepts. The API-key
+  # variable sends "x-api-key" instead and every request comes back 401.
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+  export ANTHROPIC_AUTH_TOKEN="$key"
+  export ANTHROPIC_MODEL="$id"
+  # Claude Code calls a small model in the background (titles, quota checks). Every alias
+  # points at the one model this card has loaded; splitting them would reload the
+  # checkpoint on each background call.
+  export ANTHROPIC_SMALL_FAST_MODEL="$id"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$id"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$id"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$id"
+  # Claude Code does not know this model, and for an unknown model it assumes a 200k
+  # window and auto-compacts there, throwing away 60k of the window this profile actually
+  # serves. MAX_LEN is what the running profile was started with, so the client and the
+  # server agree without a constant here going stale.
+  local maxlen; maxlen=$(container_env "$(running_service)" MAX_LEN)
+  [ -n "$maxlen" ] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$maxlen"
+  echo "qwen38: claude -> http://127.0.0.1:$PORT as $id${maxlen:+ (window $maxlen)}" >&2
+  exec claude "$@"
+}
+run_pi() {
+  command -v pi >/dev/null 2>&1 || { echo "qwen38: pi is not on PATH" >&2; exit 1; }
+  local id; id=$(client_target)
+  local models="${PI_MODELS:-$HOME/.pi/agent/models.json}"
+  python3 - "$models" "$id" <<'PY' || exit 1
+import json, re, sys
+path, mid = sys.argv[1], sys.argv[2]
+d = json.loads(re.sub(r'^\s*//.*$', '', open(path).read(), flags=re.M))
+ids = [m['id'] for m in d['providers']['vllm5090'].get('models', []) if isinstance(m, dict)]
+if mid not in ids:
+    sys.exit(f"qwen38: {mid} is not registered for vllm5090 in {path}; registered: {', '.join(ids)}")
+PY
+  echo "qwen38: pi -> vllm5090/$id" >&2
+  exec pi --model "vllm5090/$id" "$@"
+}
 served_ids() {  local key; key=$(bash "$REPO/tools/print-api-key.sh" 2>/dev/null) || return 0
   curl -s --max-time 8 -H "Authorization: Bearer $key" "http://127.0.0.1:$PORT/v1/models" \
     | python3 -c 'import json,sys; print(", ".join(m["id"] for m in json.load(sys.stdin)["data"]))' 2>/dev/null || true
 }
 
-CMD=""; PROFILE=""; ID_OVERRIDE=""; MODEL_OVERRIDE=""; FOLLOW=""; FORCE=""
+CMD=""; PROFILE=""; ID_OVERRIDE=""; MODEL_OVERRIDE=""; FOLLOW=""; FORCE=""; CLIENT_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --id)        ID_OVERRIDE=${2:-}; shift 2 ;;
     --model)     MODEL_OVERRIDE=${2:-}; shift 2 ;;
     -f|--follow) FOLLOW=1; shift ;;
     --force)     FORCE=1; shift ;;
+    claude|pi)
+      # Everything after the client name belongs to the client, flags included.
+      [ -z "$CMD" ] || { echo "serve: $1 has to come first" >&2; usage; }
+      CMD=$1; shift; CLIENT_ARGS=("$@"); set -- ;;
     -h|--help)   usage ;;
     -*)          echo "serve: unknown flag $1" >&2; usage ;;
     *)  if [ -z "$CMD" ]; then CMD=$1
@@ -189,6 +249,8 @@ case "$CMD" in
     svc=$(running_service); [ -n "$svc" ] || { echo "serve: nothing is running" >&2; exit 1; }
     if [ -n "$FOLLOW" ]; then docker compose logs -f "$svc"; else docker compose logs --tail 40 "$svc"; fi
     exit 0 ;;
+  claude) run_claude ${CLIENT_ARGS[@]+"${CLIENT_ARGS[@]}"} ;;
+  pi)     run_pi ${CLIENT_ARGS[@]+"${CLIENT_ARGS[@]}"} ;;
   stop)
     echo "== stopping whatever of this project is running"
     docker compose --profile batch --profile single down --remove-orphans 2>&1 | sed 's/^/   /'
