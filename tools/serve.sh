@@ -113,18 +113,19 @@ run_claude() {
   # variable sends "x-api-key" instead and every request comes back 401.
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
   export ANTHROPIC_AUTH_TOKEN="$key"
-  export ANTHROPIC_MODEL="$id"
+  # The [1m] annotation is what lifts Claude Code's memory-file budget. That budget is 5%
+  # of the window the CLI believes the model has, with a floor of 40k chars, and for a model
+  # it does not recognise it falls back to that floor -- which a 55k global CLAUDE.md
+  # exceeds, so it warns on every start. The annotation makes the believed window 1M and the
+  # budget 150k. The suffix never reaches the server: the id on the wire stays $id.
+  export ANTHROPIC_MODEL="${id}[1m]"
   # Claude Code calls a small model in the background (titles, quota checks). Every alias
   # points at the one model this card has loaded; splitting them would reload the
   # checkpoint on each background call.
-  export ANTHROPIC_SMALL_FAST_MODEL="$id"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$id"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="$id"
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="$id"
-  # Claude Code does not know this model, and for an unknown model it assumes a 200k
-  # window and auto-compacts there, throwing away 60k of the window this profile actually
-  # serves. MAX_LEN is what the running profile was started with, so the client and the
-  # server agree without a constant here going stale.
+  export ANTHROPIC_SMALL_FAST_MODEL="${id}[1m]"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${id}[1m]"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="${id}[1m]"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="${id}[1m]"
   # A local endpoint disables the claude.ai connectors either way: an auth source in the
   # environment takes precedence over the claude.ai login, and the CLI says so in a warning
   # on every start. Opting out explicitly is the same state, chosen rather than tolerated,
@@ -133,7 +134,13 @@ run_claude() {
   # its connectors.
   export ENABLE_CLAUDEAI_MCP_SERVERS=false
   local maxlen; maxlen=$(container_env "$(running_service)" MAX_LEN)
-  [ -n "$maxlen" ] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$maxlen"
+  # Without this the [1m] above would let a session grow to a million tokens before the CLI
+  # compacts. The CLI combines the two as Math.min(believed, this), so the window the profile
+  # actually serves wins. MAX_LEN is what the running profile was started with, so client and
+  # server agree without a constant here going stale. (CLAUDE_CODE_MAX_CONTEXT_TOKENS, the
+  # obvious variable here, is only honoured when DISABLE_COMPACT is also set, so it does
+  # nothing for the window or for the memory budget.)
+  [ -n "$maxlen" ] && export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$maxlen"
   echo "qwen38: claude -> http://127.0.0.1:$PORT as $id${maxlen:+ (window $maxlen)}" >&2
   exec claude "$@"
 }
