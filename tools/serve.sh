@@ -142,11 +142,13 @@ case "$PROFILE" in
       echo "serve: models/Qwen3.8-27B-INT6-Mixed-AutoRound is not on disk (25.4 GB, not committed)." >&2
       echo "       /app/venv/bin/hf download Minachist/Qwen3.8-27B-INT6-Mixed-AutoRound --local-dir $INT6_DIR" >&2
       exit 1; }
-    # 262144 at 0.98 utilization is the whole card: 22.88 GiB of weights + 4 GiB pinned pool
-    # + the profiled peak leave ~350 MiB free. It is what buys context parity with fast on a
-    # checkpoint whose weights are 7 GiB heavier, and it means nothing else fits on the GPU
-    # while this profile is up. Drop --gpu-util-exact and --ctx to 196608 for headroom.
-    FLAGS=(--mode single --spec mtp --kv huge --ctx 262144 --kv-mem-gib 4 --gpu-util-exact 0.98
+      # 262144 at 0.96: 22.88 GiB of weights, the profiled peak next to it, and a pool that
+      # holds the full window, leaving about a gigabyte to the engine. 0.98 was tried and is
+      # wrong: it booted with 349 MiB free and the first long prompt died on a 68 MiB
+      # allocation (torch.OutOfMemoryError inside an inductor kernel), the restart policy
+      # turning the crash into a silent reboot. Context parity with fast is worth less than
+      # not crashing. Lower --ctx to 196608 if more margin is ever needed.
+    FLAGS=(--mode single --spec mtp --kv huge --ctx 262144 --kv-mem-gib 4 --gpu-util-exact 0.96
            --no-vision --skip-verify --env "LD_LIBRARY_PATH=$VLLM_LDP"
            --extra-args "--chat-template /app/models/qwen3.8-hybrid.jinja") ;;
   nvfp4)
@@ -253,6 +255,22 @@ if [ "${code:-}" != "200" ]; then
 fi
 echo "== served as: $EFFECTIVE_ID, qwen3.8-27b"
 
+# Headroom is what decides whether a profile survives a real request: the engine takes its
+# KV cache out of gpu_memory_utilization up front, so everything a request needs on top
+# (inductor workspaces, the peak activation of a long prefill) comes from what is left. The
+# 0.98 version of the quality profile booted with 349 MiB free and died mid-request on a
+# 68 MiB allocation, which the restart policy then reported as a plain reboot.
+free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+if [ -n "${free_mib:-}" ]; then
+  echo "== free VRAM with this profile loaded: ${free_mib} MiB"
+  if [ "$free_mib" -lt 768 ]; then
+    echo "== WARNING: ${free_mib} MiB is not enough headroom. A 103k-token prefill measured"
+    echo "   ~400 MiB of transient workspace on top of the idle figure, and short requests pass"
+    echo "   while a real one dies with 'torch.OutOfMemoryError: Tried to allocate N MiB', the"
+    echo "   restart policy hiding it as a reboot. Lower --gpu-util-exact or --ctx."
+  fi
+fi
+
 case "$PROFILE" in
   nvfp4) cat <<'EOF'
 == serving nvfp4 (QUASAR NVFP4): expect PPL 8.2854, C1 ~55 tok/s, and 397,128 tokens of
@@ -277,8 +295,9 @@ EOF
   quality|int6) cat <<'EOF'
 == serving quality (INT6-Mixed + its own INT5 MTP head, KVarN, 262144): expect PPL 7.8915
    against fast's 8.1928 (-3.6%, code -7.0%) and 97.8 tok/s on the six-task agent mix
-   against 109.5 for fast. Pool 333,637 tokens (1.27x) at 0.98 utilization, so ~5 sessions
-   at 60k, not a swarm, and nothing else fits on the card. Vision off and verify skipped:
+   against 109.5 for fast. Pool ~1.1x at 262144, so one request fits the full window
+   and concurrency is a few sessions at 60k: this profile is for one heavy task, not a swarm,
+   and at 0.96 it keeps about a gigabyte of VRAM for the engine. Vision off and verify skipped:
    the checkpoint's lm_head/embed are 16-bit by design, so verify.sh's requantization
    checks do not apply.
 EOF

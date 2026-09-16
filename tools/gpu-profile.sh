@@ -62,6 +62,11 @@ PC_VAL=1
 SPEC_VAL=dflash2
 # Explicit pinned pool size, for a checkpoint whose weights the budget model does not know.
 KV_MEM_GIB=""
+# Exact utilization, used as-is instead of the derived one. --gpu-util only ever LOWERS,
+# which is the right default; this one exists for the opposite case, a heavier checkpoint
+# on a card whose display hangs off another GPU, where the only way to a longer context is
+# to hand vLLM more of the card. It eats the transient margin by design.
+UTIL_EXACT=""
 UTIL_CAP=""      # empty = derived from the card; a checkpoint with a heavier
                  # per-step footprint (the NVFP4 path pads and swizzles) needs a
                  # lower ceiling before its boot stops fitting the budget
@@ -92,6 +97,7 @@ while [ $# -gt 0 ]; do
     --seats)       SEATS=${2:-0}; shift ;;
     --model)       MODEL_DIR=${2:-}; shift ;;
     --gpu-util)    UTIL_CAP=${2:-}; shift ;;
+    --gpu-util-exact) UTIL_EXACT=${2:-}; shift ;;
     --env)         EXTRA_ENV="${EXTRA_ENV:-}${2:-}"$'\n'; shift ;;
     --int8-act)    INT8_VAL=${2:-}; shift ;;
     --prefix-cache) PC_VAL=${2:-1}; shift ;;
@@ -442,6 +448,7 @@ if [ "$MODE" = batch ]; then
   [ -z "$MAX_LEN" ] && { echo "gpu-profile: no context ceiling fits a ${POOL_NOW_MIB} MiB pool" >&2; exit 1; }
   UTIL=$(util_for_batch)
   [ -n "$UTIL_CAP" ] && UTIL=$(awk -v a="$UTIL" -v c="$UTIL_CAP" 'BEGIN{if(c<a)printf "%.3f", c; else printf "%s", a}')
+  [ -n "$UTIL_EXACT" ] && UTIL=$UTIL_EXACT
   # INT8_ACT empty: the W4A8 path exists in this repo because int8 tensor cores
   # run at 2x fp16 on the sm86 cards every batch figure was measured on. On sm_120
   # they measure 1.05x, so the per-token activation quantization is paid for and
@@ -525,6 +532,7 @@ else
     POOL_BYTES=$(( POOL_MIB * 1048576 ))
   fi
   POOL_BYTES=$(( POOL_MIB * 1048576 ))
+  [ -n "$UTIL_EXACT" ] && UTIL=$UTIL_EXACT
   MAX_LEN_FAST=$(pick_max_len "$BPT_BF16")
   MAX_LEN_LONG=$(pick_max_len "$BPT_INT8PTH")
   MAX_LEN_HUGE=$(pick_max_len "$BPT_KVARN")
